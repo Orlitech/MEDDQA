@@ -2,6 +2,8 @@
 """
 MedDQA System - Clinical Data Quality Assurance Platform
 Multi-User Real-Time DQA & Care Card Reconciliation System
+Auto-creates database tables on startup
+Auto-configures Windows Firewall for network access
 """
 
 # ============================================================================
@@ -71,7 +73,7 @@ def ensure_single_instance():
                         import subprocess
                         result = subprocess.run(
                             f'tasklist /FI "PID eq {pid}" /NH',
-                            capture_output=True, text=True
+                            capture_output=True, text=True, shell=True
                         )
                         if str(pid) in result.stdout:
                             print("\n" + "=" * 60)
@@ -137,7 +139,6 @@ if AVAILABLE_PORT != 8000:
 def get_local_ip():
     """Get the local network IP address"""
     try:
-        # Try to get the actual network IP
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
@@ -145,7 +146,6 @@ def get_local_ip():
         return ip
     except:
         try:
-            # Fallback: get hostname IP
             hostname = socket.gethostname()
             return socket.gethostbyname(hostname)
         except:
@@ -161,31 +161,27 @@ def is_setup_complete():
     """Check if proper configuration exists - NO DEFAULT CREATION"""
     env_file = BASE_PATH / '.env'
     
-    # If no .env file exists, setup is NOT complete
     if not env_file.exists():
         return False
     
-    # Check if .env has valid credentials (not defaults)
     try:
         with open(env_file, 'r') as f:
             content = f.read()
         
-        # If it has default password 'postgres', setup is NOT complete
         if 'EMR_DB_PASSWORD=postgres' in content:
             return False
         if 'DQA_DB_PASSWORD=postgres' in content:
             return False
         
-        # Check if passwords are not empty
         lines = content.split('\n')
         for line in lines:
             if line.startswith('EMR_DB_PASSWORD='):
-                pwd = line.split('=', 1)[1].strip()
-                if not pwd or pwd == '':
+                pwd = line.split('=', 1)[1].strip().strip("'").strip('"')
+                if not pwd:
                     return False
             if line.startswith('DQA_DB_PASSWORD='):
-                pwd = line.split('=', 1)[1].strip()
-                if not pwd or pwd == '':
+                pwd = line.split('=', 1)[1].strip().strip("'").strip('"')
+                if not pwd:
                     return False
         
         return True
@@ -254,12 +250,13 @@ except ImportError:
     settings = Settings()
 
 try:
-    from app.database import init_dqa_database, emr_engine, dqa_engine
+    from app.database import init_dqa_database, emr_engine, dqa_engine, Base
 except ImportError as e:
     print(f"⚠️ Could not import app.database: {e}")
     from sqlalchemy import create_engine
     emr_engine = create_engine('sqlite:///data/emr.db')
     dqa_engine = create_engine('sqlite:///data/dqa.db')
+    Base = None
     def init_dqa_database():
         print("Initializing DQA database...")
 
@@ -322,12 +319,10 @@ def setup_logging():
     log_format = '%(asctime)s │ %(levelname)-18s │ %(name)-25s │ %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
     
-    # Console handler with colors
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(ColoredFormatter(log_format, datefmt=date_format))
     console_handler.setLevel(logging.INFO)
     
-    # File handler for persistent logs
     log_dir = Path('logs')
     log_dir.mkdir(exist_ok=True)
     
@@ -341,14 +336,12 @@ def setup_logging():
     ))
     file_handler.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
     
-    # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG if settings.DEBUG else logging.INFO)
     root_logger.handlers.clear()
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
     
-    # Suppress verbose loggers
     logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
     logging.getLogger('sqlalchemy.pool').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -387,7 +380,6 @@ def print_banner():
 def print_status(message, status='info', indent=4):
     """Print a formatted status message"""
     prefix = ' ' * indent
-    
     icons = {
         'info': f'{Colors.CYAN}ℹ{Colors.ENDC}',
         'success': f'{Colors.GREEN}✅{Colors.ENDC}',
@@ -395,7 +387,6 @@ def print_status(message, status='info', indent=4):
         'warning': f'{Colors.WARNING}⚠️{Colors.ENDC}',
         'working': f'{Colors.BLUE}🔄{Colors.ENDC}',
     }
-    
     icon = icons.get(status, icons['info'])
     print(f"{prefix}{icon}  {message}")
 
@@ -414,20 +405,16 @@ def print_section_end():
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully"""
     print(f"\n\n{Colors.WARNING}  📥 Shutting down MedDQA...{Colors.ENDC}\n")
-    
     print_section("Shutting Down")
-    
     try:
         print_status("Closing database connections...", 'working')
-        emr_engine.dispose()
-        dqa_engine.dispose()
+        if emr_engine: emr_engine.dispose()
+        if dqa_engine: dqa_engine.dispose()
         print_status("Connections closed", 'success')
-    except Exception as e:
+    except:
         pass
-    
     print_section_end()
     
-    # Clean up lock file
     lock_file = os.path.join(tempfile.gettempdir(), 'meddqa_system.lock')
     try:
         if os.path.exists(lock_file):
@@ -447,21 +434,139 @@ def open_browser():
     def _open():
         time.sleep(2)
         url = f"http://localhost:{AVAILABLE_PORT}"
-        
-        # If setup is not complete, go to setup page
         if not is_setup_complete():
             url += "/setup"
-        
         try:
             webbrowser.open(url)
             logger.info(f"Browser opened: {url}")
         except Exception as e:
             logger.info(f"Please open your browser and go to: {url}")
-    
     threading.Thread(target=_open, daemon=True).start()
 
 # ============================================================================
-# DATABASE INITIALIZATION (only if configured)
+# AUTO-CHECK AND CREATE DATABASE TABLES
+# ============================================================================
+
+def check_and_create_tables():
+    """
+    Check if all required tables exist in the DQA database.
+    If any table is missing, create it automatically.
+    """
+    if not is_setup_complete():
+        return
+    
+    if not dqa_engine:
+        print_status("DQA database not configured, skipping table check", 'warning')
+        return
+    
+    try:
+        from sqlalchemy import inspect, text
+        
+        print_section("Database Table Check")
+        print_status("Checking DQA database tables...", 'working')
+        
+        inspector = inspect(dqa_engine)
+        existing_tables = inspector.get_table_names()
+        
+        required_tables = ['care_card_records', 'dqa_audit_logs', 'correction_logs','lab_settings']
+        missing_tables = [t for t in required_tables if t not in existing_tables]
+        
+        if missing_tables:
+            print_status(f"Missing tables: {', '.join(missing_tables)}", 'warning')
+            print_status("Creating missing tables...", 'working')
+            
+            try:
+                from app.models.dqa_models import CareCardRecord, DQAAuditLog, CorrectionLog
+                Base.metadata.create_all(bind=dqa_engine)
+                
+                inspector = inspect(dqa_engine)
+                updated_tables = inspector.get_table_names()
+                still_missing = [t for t in required_tables if t not in updated_tables]
+                
+                if still_missing:
+                    print_status("Trying raw SQL creation...", 'working')
+                    with dqa_engine.connect() as conn:
+                        conn.execute(text("""
+                            CREATE TABLE IF NOT EXISTS care_card_records (
+                                id SERIAL PRIMARY KEY, uuid UUID DEFAULT gen_random_uuid(),
+                                hospital_number VARCHAR(100) NOT NULL, person_uuid VARCHAR(100),
+                                drug_pickups JSONB DEFAULT '[]'::jsonb,
+                                viral_loads JSONB DEFAULT '[]'::jsonb,
+                                enrollment_data JSONB DEFAULT '{}'::jsonb,
+                                is_verified BOOLEAN DEFAULT FALSE, verified_by VARCHAR(200),
+                                verified_at TIMESTAMP WITH TIME ZONE,
+                                created_by VARCHAR(200), updated_by VARCHAR(200),
+                                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                            )
+                        """))
+                        conn.execute(text("""
+                            CREATE TABLE IF NOT EXISTS dqa_audit_logs (
+                                id SERIAL PRIMARY KEY, uuid UUID DEFAULT gen_random_uuid(),
+                                hospital_number VARCHAR(100) NOT NULL, person_uuid VARCHAR(100),
+                                first_name VARCHAR(200), surname VARCHAR(200),
+                                facility_name VARCHAR(300), state VARCHAR(100),
+                                care_card_data JSONB, emr_snapshot JSONB,
+                                validation_status VARCHAR(50),
+                                discrepancies_found BOOLEAN DEFAULT FALSE,
+                                issues_fixed INTEGER DEFAULT 0,
+                                total_comparisons INTEGER DEFAULT 0,
+                                matched_comparisons INTEGER DEFAULT 0,
+                                user_name VARCHAR(200),
+                                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                            )
+                        """))
+                        conn.execute(text("""
+                            CREATE TABLE IF NOT EXISTS correction_logs (
+                                id SERIAL PRIMARY KEY, uuid UUID DEFAULT gen_random_uuid(),
+                                hospital_number VARCHAR(100), person_uuid VARCHAR(100),
+                                field_corrected VARCHAR(200), old_value TEXT, new_value TEXT,
+                                corrected_by VARCHAR(200), record_type VARCHAR(50),
+                                audit_log_id INTEGER,
+                                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                            )
+                        """))
+                        conn.execute(text("""
+                            CREATE TABLE IF NOT EXISTS lab_settings (
+                                id SERIAL PRIMARY KEY,
+                                uuid UUID DEFAULT gen_random_uuid(),
+                                pcr_lab_name VARCHAR(200) DEFAULT '',
+                                facility_name VARCHAR(200) DEFAULT '',
+                                clinician_name VARCHAR(200) DEFAULT '',
+                                assayed_by_name VARCHAR(200) DEFAULT '',
+                                approved_by_name VARCHAR(200) DEFAULT '',
+                                collected_by_name VARCHAR(200) DEFAULT '',
+                                created_by VARCHAR(200),
+                                updated_by VARCHAR(200),
+                                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                            )
+                        """))
+
+                        conn.commit()
+                        print_status("Tables created via raw SQL", 'success')
+            except Exception as create_error:
+                print_status(f"Table creation error: {str(create_error)[:100]}", 'error')
+            
+            inspector = inspect(dqa_engine)
+            final_tables = inspector.get_table_names()
+            final_missing = [t for t in required_tables if t not in final_tables]
+            
+            if final_missing:
+                print_status(f"CRITICAL: Still missing tables: {', '.join(final_missing)}", 'error')
+            else:
+                print_status("All required tables exist!", 'success')
+        else:
+            print_status("All required tables already exist!", 'success')
+        
+        print_section_end()
+        
+    except Exception as e:
+        print_status(f"Table check error: {str(e)[:100]}", 'error')
+
+# ============================================================================
+# DATABASE INITIALIZATION
 # ============================================================================
 
 def initialize_databases():
@@ -477,23 +582,66 @@ def initialize_databases():
     return False
 
 # ============================================================================
-# FIREWALL HELPER (Windows)
+# ✅ FIREWALL AUTO-CONFIGURATION (Windows) - FIXED WITH TIMEOUT
 # ============================================================================
 
-def check_firewall():
-    """Check and suggest firewall rules for Windows"""
-    if sys.platform == 'win32':
+def check_and_create_firewall():
+    """Check and automatically create firewall rules for Windows"""
+    if sys.platform != 'win32':
+        return
+    
+    try:
+        import subprocess
+        
+        # Check if rule exists (with timeout)
         try:
-            import subprocess
             result = subprocess.run(
-                f'netsh advfirewall firewall show rule name="MedDQA"',
-                capture_output=True, text=True, shell=True
+                'netsh advfirewall firewall show rule name="MedDQA"',
+                capture_output=True, text=True, shell=True,
+                timeout=5  # ✅ 5 second timeout
             )
-            if result.returncode != 0:
-                print_status(f"Firewall rule not found. Run this command to allow access:", 'warning')
+            rule_exists = result.returncode == 0
+        except subprocess.TimeoutExpired:
+            print_status("⚠️ Firewall check timed out (may need Admin rights)", 'warning')
+            print(f"  {Colors.CYAN}Manually run as Administrator:{Colors.ENDC}")
+            print(f"  {Colors.CYAN}netsh advfirewall firewall add rule name=\"MedDQA\" dir=in action=allow protocol=TCP localport={AVAILABLE_PORT}{Colors.ENDC}")
+            return
+        except Exception:
+            rule_exists = False
+        
+        if rule_exists:
+            print_status("✅ Firewall rule already exists", 'success')
+            return
+        
+        # Rule doesn't exist - try to create it
+        print_status("Creating Windows Firewall rule...", 'working')
+        
+        try:
+            create_result = subprocess.run(
+                f'netsh advfirewall firewall add rule name="MedDQA" dir=in action=allow protocol=TCP localport={AVAILABLE_PORT}',
+                capture_output=True, text=True, shell=True,
+                timeout=10  # ✅ 10 second timeout
+            )
+            
+            if create_result.returncode == 0:
+                print_status(f"✅ Firewall rule created for port {AVAILABLE_PORT}", 'success')
+            elif "Access is denied" in create_result.stderr or "administrator" in create_result.stderr.lower():
+                print_status("⚠️ Admin rights required for firewall rule", 'warning')
+                print(f"  {Colors.CYAN}Run PowerShell as Administrator and execute:{Colors.ENDC}")
                 print(f"  {Colors.CYAN}netsh advfirewall firewall add rule name=\"MedDQA\" dir=in action=allow protocol=TCP localport={AVAILABLE_PORT}{Colors.ENDC}")
-        except:
-            pass
+            else:
+                print_status(f"⚠️ Firewall rule may not be needed", 'info')
+        except subprocess.TimeoutExpired:
+            print_status("⚠️ Firewall creation timed out", 'warning')
+            print(f"  {Colors.CYAN}Run manually as Administrator:{Colors.ENDC}")
+            print(f"  {Colors.CYAN}netsh advfirewall firewall add rule name=\"MedDQA\" dir=in action=allow protocol=TCP localport={AVAILABLE_PORT}{Colors.ENDC}")
+        except Exception as e:
+            print_status(f"⚠️ Firewall config skipped: {str(e)[:50]}", 'info')
+            
+    except Exception as e:
+        logger.warning(f"Firewall check failed: {e}")
+        # Don't block startup - just show message
+        print_status("ℹ️ Firewall check skipped - network access may be limited", 'info')
 
 # ============================================================================
 # MAIN ENTRY POINT
@@ -502,33 +650,36 @@ def check_firewall():
 def main():
     """Main application entry point"""
     
-    # Setup signal handlers for graceful shutdown
+    # Setup signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     # Display banner
     print_banner()
     
-    # Show current time
     from datetime import datetime
     print(f"  {Colors.WHITE_BOLD}Started at:{Colors.ENDC} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     if AVAILABLE_PORT != 8000:
         print(f"  {Colors.WARNING}⚠️ Port 8000 was in use, using port {AVAILABLE_PORT}{Colors.ENDC}")
     
-    # Show setup status
+    # Setup status
     if is_setup_complete():
         print(f"  {Colors.GREEN}✓ Database configured{Colors.ENDC}")
         initialize_databases()
+        check_and_create_tables()
     else:
         print(f"  {Colors.WARNING}⚠️ Not configured - setup wizard will open{Colors.ENDC}")
     
-    # Server configuration - USE 0.0.0.0 FOR NETWORK ACCESS
+    # ✅ AUTO-CREATE FIREWALL RULE
+    check_and_create_firewall()
+    
+    # Server configuration
     print_section("Server Configuration")
     
     server_config = {
         "app": app,
-        "host": "0.0.0.0",  # ← Allows network access from other computers
+        "host": "0.0.0.0",
         "port": AVAILABLE_PORT,
         "reload": False,
         "workers": 1,
@@ -540,32 +691,21 @@ def main():
     }
     
     print_status(f"Environment: {'Development' if settings.DEBUG else 'Production'}", 'info')
-    print_status(f"Workers: {server_config['workers']}", 'info')
-    print_status(f"Debug Mode: {'ON' if settings.DEBUG else 'OFF'}", 'info')
     print_status(f"Port: {AVAILABLE_PORT}", 'info')
     print_status(f"Host: 0.0.0.0 (all network interfaces)", 'success')
     
     print_section_end()
     
-    # Display access URLs
+    # Access URLs
     local_url = f"http://localhost:{AVAILABLE_PORT}"
     network_url = f"http://{LOCAL_IP}:{AVAILABLE_PORT}"
     api_docs = f"{local_url}/docs"
     setup_url = f"{local_url}/setup"
     
-    # Show restart notice if setup is not complete
     if not is_setup_complete():
         print(f"""
 {Colors.BOLD}{Colors.WARNING}  ╔═══════════════════════════════════════════════════════════════╗
-  ║                   ⚡ IMPORTANT NOTICE ⚡                       ║
-  ║                                                               ║
-  ║     After completing setup in the browser:                    ║
-  ║     • Click 'Save Configuration'                              ║
-  ║     • Then RESTART this application                           ║
-  ║     • The new database credentials will take effect           ║
-  ║                                                               ║
-  ║     Press CTRL+C to stop, then run again                      ║
-  ║                                                               ║
+  ║     After completing setup, RESTART this application              ║
   ╚═══════════════════════════════════════════════════════════════╝
 {Colors.ENDC}
         """)
@@ -574,32 +714,22 @@ def main():
 {Colors.BOLD}{Colors.GREEN}  ╔═══════════════════════════════════════════════════════════════╗
   ║                   🚀  SERVER IS STARTING  🚀                   ║
   ║                                                               ║
-  ║     Local Access: {local_url:<39} ║
-  ║     Network Access: {network_url:<38} ║
+  ║     Local:   {local_url:<40} ║
+  ║     Network: {network_url:<40} ║
+  ║     API:     {api_docs:<40} ║
+  ║     Setup:   {setup_url:<40} ║
   ║                                                               ║
-  ║     API Docs:     {api_docs:<39} ║
-  ║     Setup:        {setup_url:<39} ║
-  ║                                                               ║
-  ║     📡 Share this URL with other computers on your network:   ║
-  ║     {Colors.BOLD}{network_url}{Colors.ENDC}
-  ║                                                               ║
-  ║     Press CTRL+C to stop the server                          ║
-  ║                                                               ║
+  ║     📡 Other PCs: {network_url}                          ║
+  ║     Press CTRL+C to stop                                     ║
   ╚═══════════════════════════════════════════════════════════════╝
 {Colors.ENDC}
     """)
     
-    # Check firewall (Windows)
-    if sys.platform == 'win32':
-        check_firewall()
-    
-    # Open browser automatically
     try:
         open_browser()
-    except Exception as e:
-        logger.info(f"Browser auto-open not available: {e}")
+    except:
+        pass
     
-    # Start the server
     try:
         uvicorn.run(**server_config)
     except KeyboardInterrupt:

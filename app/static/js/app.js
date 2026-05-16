@@ -371,7 +371,9 @@ function renderEMRData(data) {
     
     let html = '';
     
+    // ========================================================================
     // PATIENT HERO CARD
+    // ========================================================================
     html += `<div class="patient-hero-card"><div class="patient-hero-content">
         <div class="patient-avatar-xl"><span>${(p.first_name?.charAt(0)||'')}${(p.surname?.charAt(0)||'')}</span></div>
         <div class="patient-hero-info">
@@ -397,7 +399,149 @@ function renderEMRData(data) {
         </div>
     </div></div>`;
     
+        // ========================================================================
+    // ✅ ROC VERIFICATION STATUS + CURRENT ART STATUS (from EMR)
+    // ========================================================================
+    const cv = data.client_verification;
+    const artStatus = data.current_art_status;
+    
+    if (cv && cv.verification_outcome) {
+        const cvVerified = cv.verification_status === 'Verified' || cv.verification_outcome === 'Verified';
+        
+        // ART Status styling
+        const artStatusColor = artStatus?.status === 'Active' ? '#10b981' : 
+                               artStatus?.status === 'IIT' ? '#ef4444' : '#f59e0b';
+        const artStatusBg = artStatus?.status === 'Active' ? '#ecfdf5' : 
+                            artStatus?.status === 'IIT' ? '#fef2f2' : '#fffbeb';
+        
+        html += `
+        <div class="roc-verification-card" style="
+            background: linear-gradient(135deg, ${cvVerified ? '#ecfdf5' : '#fffbeb'}, ${cvVerified ? '#d1fae5' : '#fef3c7'});
+            border: 2px solid ${cvVerified ? '#10b981' : '#f59e0b'};
+            border-radius: 16px;
+            padding: 20px 24px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            flex-wrap: wrap;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            transition: all 0.3s ease;
+        ">
+            <!-- Status Icon -->
+            <div style="
+                flex-shrink: 0;
+                width: 56px;
+                height: 56px;
+                border-radius: 50%;
+                background: ${cvVerified ? 'linear-gradient(135deg, #10b981, #059669)' : 'linear-gradient(135deg, #f59e0b, #d97706)'};
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 1.6rem;
+                color: white;
+                box-shadow: 0 4px 12px ${cvVerified ? 'rgba(16,185,129,0.3)' : 'rgba(245,158,11,0.3)'};
+            ">
+                <i class="bi ${cvVerified ? 'bi-person-check' : 'bi-person-exclamation'}"></i>
+            </div>
+            
+            <!-- Details -->
+            <div style="flex: 1; min-width: 200px;">
+                <div style="
+                    font-weight: 800;
+                    font-size: 1rem;
+                    color: ${cvVerified ? '#059669' : '#92400e'};
+                    margin-bottom: 6px;
+                    letter-spacing: -0.01em;
+                ">
+                    <i class="bi ${cvVerified ? 'bi-check-circle-fill' : 'bi-exclamation-circle-fill'} me-2"></i>
+                    ROC Verification Status
+                </div>
+                <div style="display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.8rem; color: #475569;">
+                    <span>
+                        <span style="color: #94a3b8; font-weight: 500;">Outcome:</span> 
+                        <strong style="color: ${cvVerified ? '#059669' : '#d97706'};">${cv.verification_outcome || 'N/A'}</strong>
+                    </span>
+                    <span>
+                        <span style="color: #94a3b8; font-weight: 500;">Status:</span> 
+                        <strong>${cv.verification_status || 'N/A'}</strong>
+                    </span>
+                    <span>
+                        <span style="color: #94a3b8; font-weight: 500;">Date:</span> 
+                        <strong>${formatDate(cv.date_of_outcome)}</strong>
+                    </span>
+                </div>
+            </div>
+            
+            <!-- Outcome Badge -->
+            <div style="
+                flex-shrink: 0;
+                text-align: center;
+                background: white;
+                border-radius: 12px;
+                padding: 14px 22px;
+                border: 2px solid ${cvVerified ? '#a7f3d0' : '#fde68a'};
+                box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+            ">
+                <div style="
+                    font-size: 0.6rem;
+                    color: #94a3b8;
+                    text-transform: uppercase;
+                    font-weight: 700;
+                    letter-spacing: 0.08em;
+                    margin-bottom: 4px;
+                ">Outcome</div>
+                <div style="
+                    font-size: 1.2rem;
+                    font-weight: 800;
+                    color: ${cvVerified ? '#059669' : '#d97706'};
+                    letter-spacing: -0.02em;
+                ">${cv.verification_outcome || 'N/A'}</div>
+                <div style="
+                    font-size: 0.65rem;
+                    color: #94a3b8;
+                    margin-top: 2px;
+                    font-weight: 500;
+                ">${formatDate(cv.date_of_outcome)}</div>
+            </div>
+            
+            <!-- Current ART Status Badge -->
+            ${artStatus ? `
+            <div style="
+                flex-shrink: 0;
+                text-align: center;
+                background: ${artStatusBg};
+                border-radius: 12px;
+                padding: 14px 22px;
+                border: 2px solid ${artStatusColor};
+                box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+            ">
+                <div style="
+                    font-size: 0.6rem;
+                    color: #94a3b8;
+                    text-transform: uppercase;
+                    font-weight: 700;
+                    letter-spacing: 0.08em;
+                    margin-bottom: 4px;
+                ">Current ART Status</div>
+                <div style="
+                    font-size: 1.2rem;
+                    font-weight: 800;
+                    color: ${artStatusColor};
+                    letter-spacing: -0.02em;
+                ">
+                    <i class="bi ${artStatus.status === 'Active' ? 'bi-check-circle-fill' : artStatus.status === 'IIT' ? 'bi-x-circle-fill' : 'bi-exclamation-circle-fill'}"></i>
+                    ${artStatus.status || 'N/A'}
+                </div>
+                
+            </div>
+            ` : ''}
+        </div>`;
+    }
+    
+    // ========================================================================
     // QUICK INFO GRID
+    // ========================================================================
     html += '<div class="quick-info-grid">';
     html += makeInfoCell('Sex', p.sex||'N/A', true, 'sex', 'patient');
     html += makeInfoCell('Date of Birth', formatDate(p.date_of_birth), true, 'date_of_birth', 'patient');
@@ -409,7 +553,9 @@ function renderEMRData(data) {
     html += makeInfoCell('Person UUID', (p.person_uuid||'').substring(0,12)+'...', false);
     html += '</div>';
     
+    // ========================================================================
     // CURRENT REGIMEN CARD
+    // ========================================================================
     if (currentRegimen.current_regimen) {
         html += '<div class="current-regimen-card"><div class="section-header"><h6><i class="bi bi-capsule text-primary me-2"></i>Current Regimen</h6></div><div class="current-regimen-content">';
         html += `<div class="regimen-main">${currentRegimen.current_regimen}</div>`;
@@ -420,7 +566,9 @@ function renderEMRData(data) {
         html += '</div></div></div>';
     }
     
+    // ========================================================================
     // DRUG DISPENSING HISTORY
+    // ========================================================================
     html += '<div class="drugs-master-section">';
     html += '<div class="drugs-section-header"><div class="drugs-section-title"><i class="bi bi-capsule"></i><span>Drug Dispensing History</span>';
     html += `<span class="drugs-count-pill">${groupedVisits.length} visits | ${refills.length} drugs</span></div>`;
@@ -474,10 +622,47 @@ function renderEMRData(data) {
                 const lineColor = getLineColor(drugLine);
                 const durationColor = getDurationColor(duration);
                 
+                // ✅ Height & Weight with EDIT BUTTONS
+                const weight = drug.weight_kg || '';
+                const height = drug.height_cm || '';
+                let vitalsHtml = '';
+                vitalsHtml = `<div style="display:flex; gap:10px; margin-top:6px; font-size:0.7rem; color:#64748b; flex-wrap:wrap; align-items:center;">`;
+                
+                // Weight with edit button
+                vitalsHtml += `<span style="display:flex; align-items:center; gap:3px; background:#f8fafc; padding:2px 8px; border-radius:4px; border:1px solid #e2e8f0;">
+                    <i class="bi bi-speedometer2"></i> 
+                    <strong>${weight || '?'}</strong> kg
+                    <button class="btn-edit-xs auth-required" onclick="event.stopPropagation(); editVitalWeight('${weight}','${drugId}')" title="Edit Weight (Auth Required)" style="font-size:0.55rem; padding:1px 4px;">
+                        <i class="bi bi-pencil"></i>
+                    </button>
+                </span>`;
+                
+                // Height with edit button
+                vitalsHtml += `<span style="display:flex; align-items:center; gap:3px; background:#f8fafc; padding:2px 8px; border-radius:4px; border:1px solid #e2e8f0;">
+                    <i class="bi bi-arrows-vertical"></i> 
+                    <strong>${height || '?'}</strong> cm
+                    <button class="btn-edit-xs auth-required" onclick="event.stopPropagation(); editVitalHeight('${height}','${drugId}')" title="Edit Height (Auth Required)" style="font-size:0.55rem; padding:1px 4px;">
+                        <i class="bi bi-pencil"></i>
+                    </button>
+                </span>`;
+                
+                // BMI (calculated)
+                if (weight && height) {
+                    const bmi = (parseFloat(weight) / ((parseFloat(height)/100) ** 2)).toFixed(1);
+                    let bmiColor = '#64748b';
+                    if (bmi < 18.5) bmiColor = '#f59e0b';
+                    else if (bmi > 30) bmiColor = '#ef4444';
+                    else if (bmi >= 18.5 && bmi <= 25) bmiColor = '#10b981';
+                    vitalsHtml += `<span style="font-weight:600; color:${bmiColor};">BMI: ${bmi}</span>`;
+                }
+                
+                vitalsHtml += `</div>`;
+                
                 html += `<div class="drug-card-premium" style="animation:fadeInUp 0.4s ease ${drugIdx*0.08}s both;border-left:4px solid ${lineColor};">
                     <div class="drug-card-left"><div class="drug-card-icon-circle" style="background:${lineColor}20;color:${lineColor};"><i class="bi bi-capsule-fill"></i></div></div>
                     <div class="drug-card-center">
                         <div class="drug-card-title-row"><span class="drug-card-name">${drugName}</span>${drugLine?`<span class="drug-card-line-tag" style="background:${lineColor}15;color:${lineColor};">${drugLine}</span>`:''}</div>
+                        ${vitalsHtml}
                         <div class="drug-card-actions-row">
                             <button class="btn-drug-action auth-required" onclick="event.stopPropagation(); editDrugDuration('${duration}','${drugId}','${drugName.replace(/'/g,"\\'")}')" title="Edit Duration (Auth Required)"><i class="bi bi-shield-lock"></i> Duration</button>
                             <button class="btn-drug-action auth-required" onclick="event.stopPropagation(); editDrugRegimen('${drugName.replace(/'/g,"\\'")}','${drugId}','${(drugLine||'').replace(/'/g,"\\'")}')" title="Edit Regimen (Auth Required)"><i class="bi bi-shield-lock"></i> Regimen</button>
@@ -487,7 +672,8 @@ function renderEMRData(data) {
                         <svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="17" fill="none" stroke="#e5e7eb" stroke-width="3"/><circle cx="20" cy="20" r="17" fill="none" stroke="${durationColor}" stroke-width="3" stroke-dasharray="${Math.min(100,(duration/90)*100)} 100" stroke-linecap="round" transform="rotate(-90 20 20)"/></svg>
                         <span class="duration-number-mini">${duration}</span></div><span class="duration-label-mini">days</span></div></div>
                     ${isLatest&&drugIdx===0?'<div class="drug-card-corner-badge">Current</div>':''}
-                </div>`;
+                </div>
+                ${getValidationBadge(drug)}`;
             });
             
             html += `</div></div></div>`;
@@ -500,7 +686,9 @@ function renderEMRData(data) {
     }
     html += '</div>';
     
+    // ========================================================================
     // VIRAL LOAD SECTION
+    // ========================================================================
     html += '<div class="vl-section-premium"><div class="section-header"><h6><i class="bi bi-droplet text-danger me-2"></i>Viral Load History</h6><span class="count-badge vl">'+vls.length+' records</span></div>';
     
     if (vls.length > 0) {
@@ -514,11 +702,27 @@ function renderEMRData(data) {
         });
         html += '</div>';
         
-        html += '<div class="table-premium-wrapper"><table class="table-premium"><thead><tr><th>Sample Date</th><th>Result</th><th>Classification</th><th>Result Date</th></tr></thead><tbody>';
-        vls.forEach((v,i) => {
-            const classification = classifyViralLoad(v.viral_load_result||'N/A');
-            html += `<tr style="animation:fadeIn 0.4s ease ${i*0.05}s both;"><td><strong>${formatDate(v.sample_collection_date)}</strong></td><td><span class="${classification.class}" style="font-size:1.1rem;">${v.viral_load_result||'N/A'}</span></td><td>${classification.badge}</td><td>${formatDate(v.result_date)}</td></tr>`;
+        html += '<div class="table-premium-wrapper"><table class="table-premium"><thead><tr><th>Sample Date</th><th>Result</th><th>Classification</th><th>Result Date</th><th style="width:60px;">Print</th></tr></thead><tbody>';
+
+        vls.forEach((v, i) => {
+            const classification = classifyViralLoad(v.viral_load_result || 'N/A');
+            const sampleDate = formatDate(v.sample_collection_date);
+            const hn = p.hospital_number || '';
+            const sd = v.sample_collection_date || '';
+            
+            html += `<tr style="animation:fadeIn 0.4s ease ${i*0.05}s both;">
+                <td><strong>${sampleDate}</strong></td>
+                <td><span class="${classification.class}" style="font-size:1.1rem;">${v.viral_load_result || 'N/A'}</span></td>
+                <td>${classification.badge}</td>
+                <td>${formatDate(v.result_date)}</td>
+                <td style="text-align:center;">
+                    <button class="btn-print-vl" onclick="printVLResult('${hn.replace(/'/g,"\\'")}','${sd}')" title="Print VL Result">
+                        <i class="bi bi-printer"></i>
+                    </button>
+                </td>
+            </tr>`;
         });
+
         html += '</tbody></table></div>';
         
         const suppressed = vls.filter(v=>{const n=parseInt(String(v.viral_load_result||'').replace(/[^0-9]/g,''));return!isNaN(n)&&n<1000;}).length;
@@ -546,6 +750,34 @@ function renderEMRData(data) {
 function getDrugShortName(fullName) {
     if (!fullName) return '???';
     return fullName.split('/').map(p => p.trim().split(' ')[0]).join('/');
+}
+
+// ============================================================================
+// REFILL VALIDATION HELPERS
+// ============================================================================
+
+function getClassificationColor(classification) {
+    const colors = {
+        "ART Initiation": "#3b82f6",
+        "On-Time Refill": "#10b981",
+        "Acceptable Early": "#8b5cf6",
+        "Late Refill": "#f59e0b",
+        "Excessively Early": "#ef4444",
+        "Possible Overlap": "#dc2626",
+    };
+    return colors[classification] || "#6b7280";
+}
+
+function getClassificationIcon(classification) {
+    const icons = {
+        "ART Initiation": "bi-star-fill",
+        "On-Time Refill": "bi-check-circle-fill",
+        "Acceptable Early": "bi-clock-fill",
+        "Late Refill": "bi-exclamation-triangle-fill",
+        "Excessively Early": "bi-x-circle-fill",
+        "Possible Overlap": "bi-shield-exclamation",
+    };
+    return icons[classification] || "bi-question-circle-fill";
 }
 
 function getLineColor(line) {
@@ -661,7 +893,7 @@ function showPasskeyDialog() {
             <div class="passkey-dialog-icon"><i class="bi bi-shield-lock-fill"></i></div>
             <h5>Authorization Required</h5><p class="passkey-dialog-sub">Enter passkey to modify EMR data</p>
             <div class="passkey-input-premium"><i class="bi bi-lock-fill"></i><input type="password" id="passkeyInputPrem" placeholder="Enter passkey..." autofocus></div>
-            <div class="passkey-dialog-hint"><i class="bi bi-info-circle"></i> Passkeys: admin123, dqa2024, pharm2024, 1234</div>
+            <div class="passkey-dialog-hint"><i class="bi bi-info-circle"></i> Passkeys:askadmin</div>
             <div class="passkey-dialog-actions">
                 <button class="btn btn-outline-secondary" id="passkeyCancelBtn">Cancel</button>
                 <button class="btn btn-primary" id="passkeySubmitBtn">Authorize <i class="bi bi-unlock"></i></button>
@@ -1464,6 +1696,31 @@ async function downloadDQASummary() {
     }
 }
 
+
+function getValidationBadge(drug) {
+    const classification = drug.refill_classification || '';
+    const comment = drug.validation_comment || '';
+    const sequenceLabel = drug.sequence_label || '';
+    const daysDiff = drug.days_early_or_late || 0;
+    const color = getClassificationColor(classification);
+    const icon = getClassificationIcon(classification);
+    const expectedDate = drug.expected_next_date || 'N/A';
+    
+    if (!classification) return '';
+    
+    return `
+    <div class="validation-badge" style="margin-top:8px; padding:8px 12px; background:${color}10; border-left:4px solid ${color}; border-radius:6px; font-size:0.7rem;">
+        <div style="display:flex; align-items:center; gap:6px; margin-bottom:3px;">
+            <i class="bi ${icon}" style="color:${color}; font-size:0.9rem;"></i>
+            <span style="font-weight:700; color:${color};">${classification}</span>
+            <span style="color:#64748b;">|</span>
+            <span style="color:#475569; font-weight:600;">${sequenceLabel}</span>
+            ${daysDiff !== 0 ? `<span style="color:${daysDiff < 0 ? '#ef4444' : '#f59e0b'}; font-weight:600;">(${Math.abs(daysDiff)}d ${daysDiff < 0 ? 'early' : 'late'})</span>` : ''}
+        </div>
+        <div style="color:#64748b; font-size:0.65rem;">📅 Expected: ${expectedDate}</div>
+        <div style="color:#64748b; font-size:0.65rem;">💬 ${comment}</div>
+    </div>`;
+}
 /**
  * Create Excel file from DQA Summary JSON data
  */
@@ -1534,10 +1791,194 @@ async function downloadDQAReport() {
     }
 }
 
+
+// ============================================================================
+// 📏 EDIT HEIGHT - Passkey Protected
+// ============================================================================
+
+async function editVitalHeight(currentHeight, drugId) {
+    if (!AppState.currentPatient) { showToast('No patient selected', 'error'); return; }
+    
+    const authorized = await requirePasskeyForEdit('modify height');
+    if (!authorized) return;
+    
+    let newHeight = prompt(`Update Height (cm):\nCurrent: ${currentHeight || 'N/A'}\n\nEnter new value:`, currentHeight || '');
+    if (!newHeight || newHeight === currentHeight) return;
+    
+    showLoading('Updating Height...', `Setting height to ${newHeight} cm`);
+    
+    try {
+        const res = await fetch('/api/patients/update', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-User': AppState.currentUser },
+            body: JSON.stringify({
+                hospital_number: AppState.currentPatient.patient_info.hospital_number,
+                field_name: 'height',
+                new_value: newHeight,
+                record_type: 'refill',
+                record_id: drugId
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Update failed');
+        showToast('✅ Height updated!', 'success');
+        await searchPatient();
+    } catch(e) { showToast('❌ ' + e.message, 'error'); }
+    finally { hideLoading(); }
+}
+
+// ============================================================================
+// ⚖️ EDIT WEIGHT - Passkey Protected
+// ============================================================================
+
+async function editVitalWeight(currentWeight, drugId) {
+    if (!AppState.currentPatient) { showToast('No patient selected', 'error'); return; }
+    
+    const authorized = await requirePasskeyForEdit('modify weight');
+    if (!authorized) return;
+    
+    let newWeight = prompt(`Update Weight (kg):\nCurrent: ${currentWeight || 'N/A'}\n\nEnter new value:`, currentWeight || '');
+    if (!newWeight || newWeight === currentWeight) return;
+    
+    showLoading('Updating Weight...', `Setting weight to ${newWeight} kg`);
+    
+    try {
+        const res = await fetch('/api/patients/update', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-User': AppState.currentUser },
+            body: JSON.stringify({
+                hospital_number: AppState.currentPatient.patient_info.hospital_number,
+                field_name: 'weight',
+                new_value: newWeight,
+                record_type: 'refill',
+                record_id: drugId
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Update failed');
+        showToast('✅ Weight updated!', 'success');
+        await searchPatient();
+    } catch(e) { showToast('❌ ' + e.message, 'error'); }
+    finally { hideLoading(); }
+}
+
+
+// ============================================================================
+// 🖨️ PRINT VL RESULT
+// ============================================================================
+
+async function printVLResult(hospitalNumber, sampleDate) {
+    showLoading('Generating VL Result PDF...', 'Preparing document for printing');
+    
+    try {
+        const url = `/api/vl/print/${encodeURIComponent(hospitalNumber)}/${encodeURIComponent(sampleDate)}`;
+        const res = await fetch(url, { headers: { 'X-User': AppState.currentUser } });
+        
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || 'Failed to generate PDF');
+        }
+        
+        const blob = await res.blob();
+        const pdfUrl = URL.createObjectURL(blob);
+        
+        // Open in new tab for printing
+        window.open(pdfUrl, '_blank');
+        
+        showToast('🖨️ VL Result PDF opened for printing!', 'success', 3000);
+    } catch(e) {
+        showToast('❌ ' + e.message, 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
+
+// ============================================================================
+// 🔧 LAB SETTINGS
+// ============================================================================
+
+async function openLabSettings() {
+    const modal = document.getElementById('labSettingsModal');
+    if (!modal) return;
+    
+    // Fetch current settings
+    try {
+        const res = await fetch('/api/lab/settings', {
+            headers: { 'X-User': AppState.currentUser }
+        });
+        const data = await res.json();
+        
+        if (data.success && data.data) {
+            document.getElementById('setPcrLabName').value = data.data.pcr_lab_name || '';
+            document.getElementById('setFacilityName').value = data.data.facility_name || '';
+            document.getElementById('setClinicianName').value = data.data.clinician_name || '';
+            document.getElementById('setAssayedByName').value = data.data.assayed_by_name || '';
+            document.getElementById('setApprovedByName').value = data.data.approved_by_name || '';
+            document.getElementById('setCollectedByName').value = data.data.collected_by_name || '';
+        }
+    } catch(e) {
+        console.error('Error loading lab settings:', e);
+    }
+    
+    modal.style.display = 'flex';
+}
+
+function closeLabSettings() {
+    const modal = document.getElementById('labSettingsModal');
+    if (modal) modal.style.display = 'none';
+}
+
+async function saveLabSettings() {
+    const settings = {
+        pcr_lab_name: document.getElementById('setPcrLabName').value.trim(),
+        facility_name: document.getElementById('setFacilityName').value.trim(),
+        clinician_name: document.getElementById('setClinicianName').value.trim(),
+        assayed_by_name: document.getElementById('setAssayedByName').value.trim(),
+        approved_by_name: document.getElementById('setApprovedByName').value.trim(),
+        collected_by_name: document.getElementById('setCollectedByName').value.trim()
+    };
+    
+    try {
+        const res = await fetch('/api/lab/settings', {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-User': AppState.currentUser
+            },
+            body: JSON.stringify(settings)
+        });
+        
+        const data = await res.json();
+        
+        if (data.success) {
+            showToast('✅ Lab settings saved!', 'success');
+            closeLabSettings();
+        } else {
+            showToast('❌ Failed to save settings', 'error');
+        }
+    } catch(e) {
+        showToast('❌ Error: ' + e.message, 'error');
+    }
+}
+
+// Close modal on backdrop click
+document.addEventListener('click', function(e) {
+    const modal = document.getElementById('labSettingsModal');
+    if (modal && e.target === modal) {
+        closeLabSettings();
+    }
+});
+
 // ============================================================================
 // EXPORT ALL TO WINDOW
 // ============================================================================
-
+window.openLabSettings = openLabSettings;
+window.closeLabSettings = closeLabSettings;
+window.saveLabSettings = saveLabSettings;
+window.printVLResult = printVLResult;
+window.editVitalHeight = editVitalHeight;
+window.editVitalWeight = editVitalWeight;
 window.searchPatient = searchPatient;
 window.resetAll = resetAll;
 window.exportReport = exportReport;
@@ -1572,7 +2013,9 @@ window.filterRegimenOptions = filterRegimenOptions;
 window.onRegimenSelectChange = onRegimenSelectChange;
 window.confirmRegimenUpdate = confirmRegimenUpdate;
 window.getRegimenDropdownOptions = getRegimenDropdownOptions;
-
+window.getClassificationColor = getClassificationColor;
+window.getClassificationIcon = getClassificationIcon;
+window.getValidationBadge = getValidationBadge;
 window.toggleReportsDropdown = toggleReportsDropdown;
 window.downloadPharmacyReport = downloadPharmacyReport;
 window.downloadVLReport = downloadVLReport;

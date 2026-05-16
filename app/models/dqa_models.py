@@ -57,6 +57,31 @@ class CorrectionLog(Base):
     audit_log_id = Column(Integer)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+class LabSettings(Base):
+    """Stores lab personnel and settings for VL result printing"""
+    __tablename__ = "lab_settings"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(UUID(as_uuid=True), default=uuid.uuid4, unique=True)
+    
+    # Lab Info
+    pcr_lab_name = Column(String(200), default="")
+    facility_name = Column(String(200), default="")
+    
+    # Personnel
+    clinician_name = Column(String(200), default="")
+    assayed_by_name = Column(String(200), default="")
+    approved_by_name = Column(String(200), default="")
+    collected_by_name = Column(String(200), default="")  # ✅ ADD THIS
+    
+    # Tracking
+    created_by = Column(String(200))
+    updated_by = Column(String(200))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<LabSettings {self.pcr_lab_name}>"
 
 class CareCardRecord(Base):
     """Stores care card data entered by users"""

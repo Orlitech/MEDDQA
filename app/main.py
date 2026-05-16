@@ -8,7 +8,7 @@ Multi-User | Real-Time | Professional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -345,9 +345,153 @@ async def get_current_config():
         return {"error": str(e)}
 
 # ============================================================================
-# PATIENT SEARCH API - FULL VERSION
+# ARV REFILL VALIDATION ENGINE
 # ============================================================================
 
+def parse_refill_date(date_str):
+    """Parse date string to date object"""
+    if not date_str:
+        return None
+    try:
+        if isinstance(date_str, datetime):
+            return date_str.date() if hasattr(date_str, 'date') else date_str
+        return datetime.strptime(str(date_str)[:10], '%Y-%m-%d').date()
+    except:
+        return None
+
+def add_days_to_date(date_obj, days):
+    """Add days to a date"""
+    if not date_obj:
+        return None
+    return date_obj + timedelta(days=int(days))
+
+def days_difference(expected, actual):
+    """Calculate days difference: negative=early, positive=late"""
+    if not expected or not actual:
+        return 0
+    return (actual - expected).days
+
+def format_date_str(date_obj):
+    """Format date object to string"""
+    if not date_obj:
+        return 'N/A'
+    return date_obj.strftime('%Y-%m-%d')
+
+def get_sequence_label(idx):
+    """Get human-readable sequence label"""
+    if idx == 0: return "ART Initiation"
+    elif idx == 1: return "First Refill"
+    else: return f"Subsequent Refill #{idx}"
+
+def validate_refill_timeline(refills):
+    """
+    Validate ARV refill timeline for a patient.
+    ONLY validates ARV drugs - skips Anti-TB, Prophylaxis, and Other drugs.
+    """
+    if not refills or len(refills) == 0:
+        return refills
+    
+    # Separate ARV drugs from non-ARV drugs
+    arv_refills = []
+    non_arv_refills = []
+    
+    for refill in refills:
+        regimen_name = refill.get('regimen_name', '') or refill.get('regimen', '')
+        drug_line = categorize_regimen(regimen_name)
+        
+        if drug_line == 'ARVs':
+            arv_refills.append(refill)
+        else:
+            # Non-ARV drugs get marked as "Not Applicable"
+            non_arv_refill = dict(refill)
+            non_arv_refill['pickup_sequence'] = 0
+            non_arv_refill['sequence_label'] = f"Non-ARV ({drug_line})"
+            non_arv_refill['expected_next_date'] = 'N/A'
+            non_arv_refill['days_early_or_late'] = 0
+            non_arv_refill['refill_classification'] = f"{drug_line} Drug"
+            non_arv_refill['validation_comment'] = f"Refill validation only applies to ARV drugs. This is a {drug_line} medication."
+            non_arv_refill['fourteen_day_applies'] = False
+            non_arv_refills.append(non_arv_refill)
+    
+    # Sort ARV refills by date (oldest first) for validation
+    if arv_refills:
+        sorted_arv = sorted(arv_refills, key=lambda r: r.get('pickup_date', ''))
+        validated_arv = []
+        
+        for i, refill in enumerate(sorted_arv):
+            pickup_date = parse_refill_date(refill.get('pickup_date'))
+            duration = int(refill.get('duration', 0)) or 30
+            
+            if i == 0:
+                # ART Initiation
+                classification = "ART Initiation"
+                comment = "First ARV pickup after enrollment. No validation required."
+                days_diff = 0
+                expected_date = pickup_date
+                
+            elif i == 1:
+                # First Refill - NO 14-day allowance
+                prev = sorted_arv[i - 1]
+                prev_date = parse_refill_date(prev.get('pickup_date'))
+                prev_dur = int(prev.get('duration', 0)) or 30
+                expected_date = add_days_to_date(prev_date, prev_dur)
+                days_diff = days_difference(expected_date, pickup_date) if pickup_date else 0
+                
+                if days_diff > 0:
+                    classification = "Late Refill"
+                    comment = f"First ARV refill {days_diff} day(s) late. Expected: {format_date_str(expected_date)} Need Tracking Form"
+                elif days_diff >= -7:
+                    classification = "On-Time Refill"
+                    comment = f"First ARV refill {abs(days_diff)} day(s) early. Within acceptable range."
+                else:
+                    classification = "Excessively Early"
+                    comment = f"First ARV refill {abs(days_diff)} day(s) early. First refill does NOT qualify for 14-day allowance."
+                    
+            else:
+                # Second refill onward - 14-day allowance APPLIES
+                prev = sorted_arv[i - 1]
+                prev_date = parse_refill_date(prev.get('pickup_date'))
+                prev_dur = int(prev.get('duration', 0)) or 30
+                expected_date = add_days_to_date(prev_date, prev_dur)
+                days_diff = days_difference(expected_date, pickup_date) if pickup_date else 0
+                
+                if days_diff > 7:
+                    classification = "Late Refill"
+                    comment = f"ARV refill {days_diff} day(s) late. Expected: {format_date_str(expected_date)}"
+                elif days_diff >= -3:
+                    classification = "On-Time Refill"
+                    comment = "ARV refill on or near expected date."
+                elif days_diff >= -14:
+                    classification = "Acceptable Early"
+                    comment = f"ARV picked up {abs(days_diff)} day(s) early. Within 14-day acceptable window."
+                elif days_diff >= -30:
+                    classification = "Excessively Early"
+                    comment = f"ARV refill {abs(days_diff)} day(s) early. Exceeds 14-day allowance. Review required."
+                else:
+                    classification = "Possible Overlap"
+                    comment = f"ARV refill {abs(days_diff)} day(s) early. Possible duplicate/overlapping refill. Urgent review required."
+            
+            # Add validation fields
+            validated_refill = dict(refill)
+            validated_refill['pickup_sequence'] = i + 1
+            validated_refill['sequence_label'] = get_sequence_label(i)
+            validated_refill['expected_next_date'] = format_date_str(expected_date) if expected_date else 'N/A'
+            validated_refill['days_early_or_late'] = days_diff
+            validated_refill['refill_classification'] = classification
+            validated_refill['validation_comment'] = comment
+            validated_refill['fourteen_day_applies'] = i >= 2
+            
+            validated_arv.append(validated_refill)
+        
+        # Combine validated ARV + non-ARV, sort newest first
+        all_validated = validated_arv + non_arv_refills
+        return sorted(all_validated, key=lambda r: r.get('pickup_date', ''), reverse=True)
+    else:
+        # No ARV drugs at all
+        return sorted(non_arv_refills, key=lambda r: r.get('pickup_date', ''), reverse=True)
+# ============================================================================
+# PATIENT SEARCH API - FULL VERSION
+# ============================================================================
 @app.get("/api/patients/search/{hospital_number:path}")
 async def search_patient(hospital_number: str, request: Request):
     """
@@ -382,8 +526,8 @@ async def search_patient(hospital_number: str, request: Request):
                         p.other_name,
                         INITCAP(p.sex) AS sex,
                         p.date_of_birth,
-                        p.date_of_registration AS date_enrolled,
-                        h.date_of_registration AS art_start_date,
+                        p.date_of_registration AS date_enrolled,              
+                        hac.visit_date::DATE AS art_start_date,                     
                         facility.name AS facility_name,
                         facility_lga.name AS lga,
                         facility_state.name AS state,
@@ -393,6 +537,8 @@ async def search_patient(hospital_number: str, request: Request):
                     INNER JOIN base_organisation_unit facility ON facility.id = h.facility_id
                     INNER JOIN base_organisation_unit facility_lga ON facility_lga.id = facility.parent_organisation_unit_id
                     INNER JOIN base_organisation_unit facility_state ON facility_state.id = facility_lga.parent_organisation_unit_id
+                    LEFT JOIN hiv_art_clinical hac ON hac.hiv_enrollment_uuid = h.uuid 
+                        AND hac.archived = 0 AND hac.is_commencement = TRUE
                     WHERE p.hospital_number = :hn AND p.archived = 0
                     LIMIT 1
                 """),
@@ -451,7 +597,7 @@ async def search_patient(hospital_number: str, request: Request):
             logger.info(f"Patient found: {patient['first_name']} {patient['surname']} (UUID: {person_uuid})")
             
             # ================================================================
-            # GET REFILLS - ALL DRUGS FROM JSONB ARRAY USING CROSS JOIN
+            # GET REFILLS - ALL DRUGS + HEIGHT/WEIGHT FROM triage_vital_sign
             # ================================================================
             refills = []
             try:
@@ -459,43 +605,44 @@ async def search_patient(hospital_number: str, request: Request):
                     text("""
                         SELECT 
                             hap.id AS visit_id,
-                            hap.visit_date AS pickup_date,
+                            hap.visit_date::DATE AS pickup_date,
                             hap.next_appointment,
                             hap.mmd_type,
                             COALESCE(
-                                (elem ->> 'duration')::INTEGER,
-                                (elem ->> 'prescribed')::INTEGER,
-                                (elem ->> 'dispense')::INTEGER,
+                                (elem.value ->> 'duration')::INTEGER,
+                                (elem.value ->> 'prescribed')::INTEGER,
+                                (elem.value ->> 'dispense')::INTEGER,
                                 hap.refill_period,
                                 0
                             ) AS duration,
                             COALESCE(
-                                elem ->> 'regimenName',
-                                elem ->> 'name',
+                                elem.value ->> 'regimenName',
+                                elem.value ->> 'name',
                                 'Unknown'
                             ) AS regimen_name,
-                            (elem ->> 'regimenId')::BIGINT AS regimen_id,
-                            COALESCE(hr.description, elem ->> 'regimenName', elem ->> 'name') AS regimen_full_name,
+                            (elem.value ->> 'regimenId')::BIGINT AS regimen_id,
+                            COALESCE(hr.description, elem.value ->> 'regimenName', elem.value ->> 'name') AS regimen_full_name,
                             COALESCE(hrt.description, 'Other') AS regimen_line,
                             COALESCE(dsd.dsd_model, '') AS dsd_model,
-                            hap.id::TEXT || '-' || ROW_NUMBER() OVER (
-                                PARTITION BY hap.id 
-                                ORDER BY elem ->> 'regimenName'
-                            )::TEXT AS id,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY hap.id 
-                                ORDER BY elem ->> 'regimenName'
-                            ) AS drug_index
+                            -- Height and Weight from triage_vital_sign via hiv_art_clinical
+                            tvs.body_weight AS weight_kg,
+                            tvs.height AS height_cm,
+                            -- Use visit_id + regimenId as unique identifier
+                            hap.id::TEXT || '-' || (elem.value ->> 'regimenId') AS id,
+                            elem.ordinality AS drug_index
                         FROM hiv_art_pharmacy hap
-                        CROSS JOIN LATERAL jsonb_array_elements(hap.extra -> 'regimens') AS elem
-                        LEFT JOIN hiv_regimen hr ON hr.id = (elem ->> 'regimenId')::BIGINT
+                        CROSS JOIN LATERAL jsonb_array_elements(hap.extra -> 'regimens') WITH ORDINALITY AS elem(value, ordinality)
+                        LEFT JOIN hiv_regimen hr ON hr.id = (elem.value ->> 'regimenId')::BIGINT
                         LEFT JOIN hiv_regimen_type hrt ON hrt.id = hr.regimen_type_id
+                        LEFT JOIN hiv_art_clinical hac ON hac.person_uuid = hap.person_uuid 
+                            AND hac.visit_date = hap.visit_date 
+                            AND hac.archived = 0
+                        LEFT JOIN triage_vital_sign tvs ON tvs.uuid = hac.vital_sign_uuid 
+                            AND tvs.archived = 0
                         LEFT JOIN (
                             SELECT DISTINCT ON (person_uuid) 
-                                person_uuid,
-                                dsd_model
-                            FROM dsd_devolvement
-                            WHERE archived = 0
+                                person_uuid, dsd_model
+                            FROM dsd_devolvement WHERE archived = 0
                             ORDER BY person_uuid, date_devolved DESC
                         ) dsd ON dsd.person_uuid = hap.person_uuid
                         WHERE hap.person_uuid = :uuid
@@ -504,7 +651,7 @@ async def search_patient(hospital_number: str, request: Request):
                         AND hap.extra -> 'regimens' IS NOT NULL
                         AND jsonb_typeof(hap.extra -> 'regimens') = 'array'
                         AND jsonb_array_length(hap.extra -> 'regimens') > 0
-                        ORDER BY hap.visit_date DESC, elem ->> 'regimenName'
+                        ORDER BY hap.visit_date DESC, elem.ordinality
                     """),
                     {"uuid": person_uuid}
                 )
@@ -519,10 +666,10 @@ async def search_patient(hospital_number: str, request: Request):
                         refill['regimen_name'] = refill.get('regimen_full_name', 'Unknown')
                     refills.append(refill)
                     
-                logger.info(f"Extracted {len(refills)} drug records from JSONB regimens array")
+                logger.info(f"Extracted {len(refills)} drug records with height/weight from triage_vital_sign")
                     
             except Exception as e:
-                logger.warning(f"JSONB refill query failed: {e}, trying fallback...")
+                logger.warning(f"JSONB refill query failed: {e}")
                 import traceback
                 traceback.print_exc()
                 try:
@@ -607,17 +754,16 @@ async def search_patient(hospital_number: str, request: Request):
                 cr_result = conn.execute(
                     text("""
                         SELECT 
-                            COALESCE(elem ->> 'regimenName', elem ->> 'name', 'Unknown') AS current_regimen,
+                            COALESCE(elem.value ->> 'regimenName', elem.value ->> 'name', 'Unknown') AS current_regimen,
                             COALESCE(hrt.description, 'Other') AS current_regimen_line,
                             hap.visit_date AS last_pickup_date,
                             hap.next_appointment
                         FROM hiv_art_pharmacy hap
-                        CROSS JOIN LATERAL jsonb_array_elements(hap.extra -> 'regimens') AS elem
-                        LEFT JOIN hiv_regimen hr ON hr.id = (elem ->> 'regimenId')::BIGINT
+                        CROSS JOIN LATERAL jsonb_array_elements(hap.extra -> 'regimens') WITH ORDINALITY AS elem(value, ordinality)
+                        LEFT JOIN hiv_regimen hr ON hr.id = (elem.value ->> 'regimenId')::BIGINT
                         LEFT JOIN hiv_regimen_type hrt ON hrt.id = hr.regimen_type_id
                         WHERE hap.archived = 0 
                         AND hap.person_uuid = :uuid
-                        AND  hrt.id IN (1,2,3,4,14,16)
                         AND hap.extra -> 'regimens' IS NOT NULL
                         AND jsonb_typeof(hap.extra -> 'regimens') = 'array'
                         ORDER BY hap.visit_date DESC
@@ -635,8 +781,126 @@ async def search_patient(hospital_number: str, request: Request):
             except Exception as e:
                 logger.warning(f"Current regimen query error: {e}")
             
-            # Get lock info
+            # ================================================================
+            # ✅ GET CLIENT VERIFICATION STATUS (ROC Verification)
+            # ================================================================
+            client_verification = None
+            try:
+                cv_result = conn.execute(
+                    text("""
+                        SELECT * FROM (
+                            SELECT 
+                                person_uuid, 
+                                data->'attempt'->0->>'outcome' AS verification_outcome,
+                                data->'attempt'->0->>'verificationStatus' AS verification_status,
+                                CAST(data->'attempt'->0->>'dateOfAttempt' AS DATE) AS date_of_outcome,
+                                ROW_NUMBER() OVER (PARTITION BY person_uuid ORDER BY CAST(data->'attempt'->0->>'dateOfAttempt' AS DATE) DESC)
+                            FROM public.hiv_observation 
+                            WHERE type = 'Client Verification' 
+                            AND archived = 0 
+                            AND CAST(data->'attempt'->0->>'dateOfAttempt' AS DATE) <= CURRENT_DATE 
+                            AND CAST(data->'attempt'->0->>'dateOfAttempt' AS DATE) >= '1990-01-01'
+                            AND person_uuid = :uuid
+                        ) clientVerification 
+                        WHERE row_number = 1 AND date_of_outcome IS NOT NULL
+                    """),
+                    {"uuid": person_uuid}
+                )
+                cv_row = cv_result.fetchone()
+                if cv_row:
+                    client_verification = {
+                        "verification_outcome": cv_row[1] or 'N/A',
+                        "verification_status": cv_row[2] or 'N/A',
+                        "date_of_outcome": str(cv_row[3]) if cv_row[3] else 'N/A'
+                    }
+                    logger.info(f"Client verification found: {client_verification['verification_outcome']}")
+            except Exception as e:
+                logger.warning(f"Client verification query error: {e}")
+            
+            # ================================================================
+            # GET CURRENT ART STATUS (from big query current_status logic)
+            # ================================================================
+            current_art_status = None
+            try:
+                status_result = conn.execute(
+                    text("""
+                        SELECT DISTINCT ON (pharmacy.person_uuid) 
+                            pharmacy.person_uuid,
+                            (CASE
+                                WHEN stat.hiv_status ILIKE '%DEATH%' OR stat.hiv_status ILIKE '%Died%' THEN 'Died'
+                                WHEN (stat.status_date > pharmacy.maxdate AND (stat.hiv_status ILIKE '%stop%' OR stat.hiv_status ILIKE '%out%' OR stat.hiv_status ILIKE '%Invalid %' OR stat.hiv_status ILIKE '%ART Transfer In%')) THEN stat.hiv_status
+                                ELSE pharmacy.status
+                            END) AS current_status,
+                            (CASE
+                                WHEN stat.hiv_status ILIKE '%DEATH%' OR stat.hiv_status ILIKE '%Died%' THEN stat.status_date
+                                WHEN (stat.status_date > pharmacy.maxdate AND (stat.hiv_status ILIKE '%stop%' OR stat.hiv_status ILIKE '%out%' OR stat.hiv_status ILIKE '%Invalid %' OR stat.hiv_status ILIKE '%ART Transfer In%')) THEN stat.status_date
+                                ELSE pharmacy.visit_date
+                            END) AS status_date
+                        FROM (
+                            SELECT
+                                (CASE
+                                    WHEN hp.visit_date + hp.refill_period + INTERVAL '29 day' <= CURRENT_DATE THEN 'IIT'
+                                    ELSE 'Active'
+                                END) AS status,
+                                (CASE
+                                    WHEN hp.visit_date + hp.refill_period + INTERVAL '29 day' <= CURRENT_DATE THEN hp.visit_date + hp.refill_period + INTERVAL '29 day'
+                                    ELSE hp.visit_date
+                                END) AS visit_date,
+                                hp.person_uuid,
+                                MAXDATE
+                            FROM hiv_art_pharmacy hp
+                            INNER JOIN (
+                                SELECT hap.person_uuid, hap.visit_date AS MAXDATE,
+                                    ROW_NUMBER() OVER (PARTITION BY hap.person_uuid ORDER BY hap.visit_date DESC) AS rn
+                                FROM hiv_art_pharmacy hap
+                                INNER JOIN hiv_art_pharmacy_regimens pr ON pr.art_pharmacy_id = hap.id
+                                INNER JOIN hiv_enrollment h ON h.person_uuid = hap.person_uuid AND h.archived = 0
+                                INNER JOIN hiv_regimen r ON r.id = pr.regimens_id
+                                INNER JOIN hiv_regimen_type rt ON rt.id = r.regimen_type_id
+                                WHERE r.regimen_type_id IN (1,2,3,4,14,16)
+                                AND hap.archived = 0
+                                AND hap.visit_date <= CURRENT_DATE
+                            ) MAX ON MAX.MAXDATE = hp.visit_date AND MAX.person_uuid = hp.person_uuid AND MAX.rn = 1
+                            WHERE hp.archived = 0 AND hp.visit_date <= CURRENT_DATE
+                        ) pharmacy
+                        LEFT JOIN (
+                            SELECT hst.hiv_status, hst.person_id, hst.cause_of_death,
+                                hst.va_cause_of_death, hst.status_date
+                            FROM (
+                                SELECT * FROM (
+                                    SELECT DISTINCT (person_id) AS person_id, status_date,
+                                        cause_of_death, va_cause_of_death, hiv_status,
+                                        ROW_NUMBER() OVER (PARTITION BY person_id ORDER BY status_date DESC)
+                                    FROM hiv_status_tracker
+                                    WHERE archived = 0 AND status_date <= CURRENT_DATE
+                                ) s WHERE s.row_number = 1
+                            ) hst
+                            INNER JOIN hiv_enrollment he ON he.person_uuid = hst.person_id
+                            WHERE hst.status_date <= CURRENT_DATE
+                        ) stat ON stat.person_id = pharmacy.person_uuid
+                        WHERE pharmacy.person_uuid = :uuid
+                    """),
+                    {"uuid": person_uuid}
+                )
+                status_row = status_result.fetchone()
+                if status_row:
+                    current_art_status = {
+                        "status": status_row[1] or 'Unknown',
+                        "status_date": str(status_row[2]) if status_row[2] else 'N/A'
+                    }
+                    logger.info(f"Current ART status: {current_art_status['status']}")
+            except Exception as e:
+                logger.warning(f"Current ART status query error: {e}")
+            
+            # ================================================================
+            # RETURN ALL DATA
+            # ================================================================
             lock_info = record_locks.get(hospital_number)
+            
+            # Apply refill validation
+            if refills:
+                refills = validate_refill_timeline(refills)
+                logger.info(f"Validated {len(refills)} refills with timeline analysis")
             
             return {
                 "success": True,
@@ -644,7 +908,9 @@ async def search_patient(hospital_number: str, request: Request):
                     "patient_info": patient,
                     "refill_history": refills,
                     "viral_load_history": viral_loads,
-                    "current_regimen": current_regimen
+                    "current_regimen": current_regimen,
+                    "client_verification": client_verification,
+                    "current_art_status": current_art_status
                 },
                 "lock_info": lock_info,
                 "user": user
@@ -658,7 +924,6 @@ async def search_patient(hospital_number: str, request: Request):
             status_code=500,
             content={"success": False, "detail": str(e)}
         )
-
 # ============================================================================
 # RECORD LOCKING
 # ============================================================================
@@ -889,7 +1154,8 @@ async def update_emr_record(request: Request):
     - Patient demographics (first_name, surname, other_name, date_of_birth)
     - Refill duration (updates both refill_period AND JSONB)
     - Refill regimen name (updates JSONB)
-    - Visit date
+    - Height & Weight (in triage_vital_sign)
+    - Visit date (syncs pharmacy, clinical, observation, triage)
     - Next appointment
     - Viral load results
     """
@@ -945,9 +1211,14 @@ async def update_emr_record(request: Request):
                 if field_name == "art_start_date" and record_type == "patient":
                     conn.execute(
                         text("""
-                            UPDATE hiv_enrollment 
-                            SET date_of_registration = :val 
-                            WHERE person_uuid = :uuid AND archived = 0
+                            UPDATE hiv_art_clinical 
+                            SET visit_date = :val 
+                            WHERE hiv_enrollment_uuid = (
+                                SELECT uuid FROM hiv_enrollment 
+                                WHERE person_uuid = :uuid AND archived = 0
+                            )
+                            AND is_commencement = TRUE 
+                            AND archived = 0
                         """),
                         {"val": new_value, "uuid": person_uuid}
                     )
@@ -1033,111 +1304,280 @@ async def update_emr_record(request: Request):
                     }
                 
                 # ============================================================
-                # REFILL UPDATE - FULL JSONB SUPPORT - 100% WORKING
+                # REFILL UPDATE - TARGET BY regimenId
                 # ============================================================
                 elif record_type == "refill":
                     if not record_id:
                         trans.rollback()
-                        return JSONResponse(
-                            status_code=400,
-                            content={"success": False, "detail": "Record ID required for refill updates"}
-                        )
+                        return JSONResponse(status_code=400, content={
+                            "success": False, "detail": "Record ID required"
+                        })
                     
-                    # Clean record_id (might be composite like "142627-1")
-                    clean_id = str(record_id).split('-')[0] if '-' in str(record_id) else str(record_id)
+                    # Parse composite ID: "76921-116" → clean_id="76921", target_regimen_id="116"
+                    clean_id = str(record_id)
+                    target_regimen_id = None
+                    
+                    if '-' in str(record_id):
+                        parts = str(record_id).split('-')
+                        clean_id = parts[0]
+                        try:
+                            target_regimen_id = parts[1]
+                        except (ValueError, IndexError):
+                            target_regimen_id = None
+                    
+                    logger.info(f"🔧 Refill update: clean_id={clean_id}, target_regimen_id={target_regimen_id}, field={field_name}")
                     
                     # --------------------------------------------------------
-                    # UPDATE DURATION
+                    # UPDATE DURATION - Target specific drug by regimenId
                     # --------------------------------------------------------
                     if field_name == "duration":
                         duration = int(new_value)
                         mmd = "MMD-1" if duration <= 30 else "MMD-2" if duration <= 60 else \
                               "MMD-3" if duration <= 90 else "MMD-4" if duration <= 120 else "MMD-6"
                         
-                        # Step 1: Update the main refill_period column
+                        # Update main refill_period
                         conn.execute(
                             text("UPDATE hiv_art_pharmacy SET refill_period = :val, mmd_type = :mmd WHERE id = :id"),
                             {"val": duration, "mmd": mmd, "id": clean_id}
                         )
                         
-                        # Step 2: Update duration AND prescribed in ALL JSONB array elements
-                        # Using jsonb_build_object - NO ::integer cast that causes syntax errors
-                        conn.execute(
-                            text("""
-                                UPDATE hiv_art_pharmacy 
-                                SET extra = jsonb_set(
-                                    extra,
-                                    '{regimens}',
-                                    (
-                                        SELECT jsonb_agg(
-                                            elem || jsonb_build_object('duration', :d, 'prescribed', :p)
+                        if target_regimen_id:
+                            # Update ONLY the drug with matching regimenId
+                            conn.execute(
+                                text("""
+                                    UPDATE hiv_art_pharmacy 
+                                    SET extra = jsonb_set(
+                                        extra,
+                                        '{regimens}',
+                                        (
+                                            SELECT jsonb_agg(
+                                                CASE 
+                                                    WHEN (elem ->> 'regimenId') = :rid 
+                                                    THEN elem || jsonb_build_object(
+                                                        'duration', :d,
+                                                        'prescribed', :p,
+                                                        'dispense', :disp
+                                                    )
+                                                    ELSE elem
+                                                END
+                                            )
+                                            FROM jsonb_array_elements(extra -> 'regimens') AS elem
                                         )
-                                        FROM jsonb_array_elements(extra -> 'regimens') AS elem
                                     )
-                                )
-                                WHERE id = :id
-                                AND extra -> 'regimens' IS NOT NULL
-                                AND jsonb_typeof(extra -> 'regimens') = 'array'
-                            """),
-                            {"d": duration, "p": duration, "id": clean_id}
-                        )
-                        logger.info(f"✅ Duration updated to {duration} days (MMD: {mmd}) for refill {clean_id}")
+                                    WHERE id = :id
+                                    AND extra -> 'regimens' IS NOT NULL
+                                    AND jsonb_typeof(extra -> 'regimens') = 'array'
+                                """),
+                                {
+                                    "d": duration,
+                                    "p": duration,
+                                    "disp": str(duration),
+                                    "id": clean_id,
+                                    "rid": target_regimen_id
+                                }
+                            )
+                        else:
+                            # Fallback: update all drugs
+                            conn.execute(
+                                text("""
+                                    UPDATE hiv_art_pharmacy 
+                                    SET extra = jsonb_set(
+                                        extra,
+                                        '{regimens}',
+                                        (
+                                            SELECT jsonb_agg(
+                                                elem || jsonb_build_object(
+                                                    'duration', :d,
+                                                    'prescribed', :p,
+                                                    'dispense', :disp
+                                                )
+                                            )
+                                            FROM jsonb_array_elements(extra -> 'regimens') AS elem
+                                        )
+                                    )
+                                    WHERE id = :id
+                                """),
+                                {"d": duration, "p": duration, "disp": str(duration), "id": clean_id}
+                            )
+                        
+                        logger.info(f"✅ Duration updated to {duration} days for regimen_id={target_regimen_id}")
                     
                     # --------------------------------------------------------
-                    # UPDATE REGIMEN NAME
+                    # UPDATE REGIMEN NAME - Target specific drug by regimenId
                     # --------------------------------------------------------
                     elif field_name == "regimen":
-                        # Update regimenName in ALL element objects in the JSONB array
-                        conn.execute(
-                            text("""
-                            UPDATE hiv_art_pharmacy 
-                            SET extra = jsonb_set(
-                                extra,
-                                '{regimens}',
-                                (
-                                    SELECT jsonb_agg(
-                                        jsonb_set(
-                                            jsonb_set(
-                                                elem,
-                                                '{name}',
-                                                to_jsonb(CAST(:rn AS text)),
-                                                true
-                                            ),
-                                            '{regimenName}',
-                                            to_jsonb(CAST(:rn AS text)),
-                                            true
+                        if target_regimen_id:
+                            conn.execute(
+                                text("""
+                                    UPDATE hiv_art_pharmacy 
+                                    SET extra = jsonb_set(
+                                        extra,
+                                        '{regimens}',
+                                        (
+                                            SELECT jsonb_agg(
+                                                CASE 
+                                                    WHEN (elem ->> 'regimenId') = :rid 
+                                                    THEN jsonb_set(elem, '{regimenName}', to_jsonb(:rn))
+                                                    ELSE elem
+                                                END
+                                            )
+                                            FROM jsonb_array_elements(extra -> 'regimens') AS elem
                                         )
                                     )
-                                    FROM jsonb_array_elements(extra -> 'regimens') AS elem
-                                )
+                                    WHERE id = :id
+                                    AND extra -> 'regimens' IS NOT NULL
+                                    AND jsonb_typeof(extra -> 'regimens') = 'array'
+                                """),
+                                {"rn": str(new_value), "id": clean_id, "rid": target_regimen_id}
                             )
-                            WHERE id = :id
-                            AND extra -> 'regimens' IS NOT NULL
-                            AND jsonb_typeof(extra -> 'regimens') = 'array'
-                            """),
-                            {"rn": str(new_value), "id": clean_id}
-                        )
-                        logger.info(f"✅ Regimen name updated to '{new_value}' for refill {clean_id}")
+                        else:
+                            conn.execute(
+                                text("""
+                                    UPDATE hiv_art_pharmacy 
+                                    SET extra = jsonb_set(
+                                        extra,
+                                        '{regimens}',
+                                        (
+                                            SELECT jsonb_agg(jsonb_set(elem, '{regimenName}', to_jsonb(:rn)))
+                                            FROM jsonb_array_elements(extra -> 'regimens') AS elem
+                                        )
+                                    )
+                                    WHERE id = :id
+                                """),
+                                {"rn": str(new_value), "id": clean_id}
+                            )
+                        
+                        logger.info(f"✅ Regimen updated to '{new_value}' for regimen_id={target_regimen_id}")
                     
                     # --------------------------------------------------------
-                    # UPDATE VISIT DATE / NEXT APPOINTMENT / MMD TYPE
+                    # UPDATE HEIGHT (in triage_vital_sign via hiv_art_clinical)
                     # --------------------------------------------------------
-                    elif field_name in ["visit_date", "next_appointment", "mmd_type"]:
+                    elif field_name == "height":
                         conn.execute(
-                            text(f"UPDATE hiv_art_pharmacy SET {field_name} = :val WHERE id = :id"),
+                            text("""
+                                UPDATE triage_vital_sign 
+                                SET height = CAST(:val AS NUMERIC)
+                                WHERE uuid IN (
+                                    SELECT hac.vital_sign_uuid 
+                                    FROM hiv_art_clinical hac 
+                                    WHERE hac.person_uuid = (
+                                        SELECT person_uuid FROM hiv_art_pharmacy WHERE id = :pharmacy_id
+                                    )
+                                    AND hac.visit_date = (
+                                        SELECT visit_date FROM hiv_art_pharmacy WHERE id = :pharmacy_id2
+                                    )
+                                    AND hac.archived = 0
+                                )
+                                AND archived = 0
+                            """),
+                            {"val": float(new_value), "pharmacy_id": clean_id, "pharmacy_id2": clean_id}
+                        )
+                        logger.info(f"✅ Height updated to {new_value} cm for visit {clean_id}")
+                    
+                    # --------------------------------------------------------
+                    # UPDATE WEIGHT (in triage_vital_sign via hiv_art_clinical)
+                    # --------------------------------------------------------
+                    elif field_name == "weight":
+                        conn.execute(
+                            text("""
+                                UPDATE triage_vital_sign 
+                                SET body_weight = CAST(:val AS NUMERIC)
+                                WHERE uuid IN (
+                                    SELECT hac.vital_sign_uuid 
+                                    FROM hiv_art_clinical hac 
+                                    WHERE hac.person_uuid = (
+                                        SELECT person_uuid FROM hiv_art_pharmacy WHERE id = :pharmacy_id
+                                    )
+                                    AND hac.visit_date = (
+                                        SELECT visit_date FROM hiv_art_pharmacy WHERE id = :pharmacy_id2
+                                    )
+                                    AND hac.archived = 0
+                                )
+                                AND archived = 0
+                            """),
+                            {"val": float(new_value), "pharmacy_id": clean_id, "pharmacy_id2": clean_id}
+                        )
+                        logger.info(f"✅ Weight updated to {new_value} kg for visit {clean_id}")
+                    
+                    # --------------------------------------------------------
+                    # ✅ UPDATE VISIT DATE - Sync ALL related tables
+                    # --------------------------------------------------------
+                    elif field_name == "visit_date":
+                        # Get OLD date first
+                        old_date_result = conn.execute(
+                            text("SELECT visit_date FROM hiv_art_pharmacy WHERE id = :id"),
+                            {"id": clean_id}
+                        )
+                        old_date_row = old_date_result.fetchone()
+                        old_date = old_date_row[0] if old_date_row else None
+                        
+                        # 1. Update hiv_art_pharmacy (the pharmacy visit)
+                        conn.execute(
+                            text("UPDATE hiv_art_pharmacy SET visit_date = :val WHERE id = :id"),
                             {"val": new_value, "id": clean_id}
                         )
-                        logger.info(f"✅ {field_name} updated to {new_value} for refill {clean_id}")
+                        logger.info(f"✅ Pharmacy visit_date updated to {new_value}")
+                        
+                        if old_date:
+                            # 2. Update hiv_art_clinical (clinical data for this visit)
+                            conn.execute(
+                                text("""
+                                    UPDATE hiv_art_clinical 
+                                    SET visit_date = CAST(:val AS DATE)
+                                    WHERE person_uuid = (
+                                        SELECT person_uuid FROM hiv_art_pharmacy WHERE id = :pharmacy_id
+                                    )
+                                    AND visit_date = CAST(:old_date AS DATE)
+                                    AND archived = 0
+                                """),
+                                {"val": new_value, "pharmacy_id": clean_id, "old_date": str(old_date)}
+                            )
+                            logger.info(f"✅ hiv_art_clinical date synced to {new_value}")
+                            
+                            # 3. Update hiv_observation (observations for this date)
+                            conn.execute(
+                                text("""
+                                    UPDATE hiv_observation 
+                                    SET date_of_observation = CAST(:val AS DATE)
+                                    WHERE person_uuid = (
+                                        SELECT person_uuid FROM hiv_art_pharmacy WHERE id = :pharmacy_id
+                                    )
+                                    AND date_of_observation = CAST(:old_date AS DATE)
+                                    AND archived = 0
+                                """),
+                                {"val": new_value, "pharmacy_id": clean_id, "old_date": str(old_date)}
+                            )
+                            logger.info(f"✅ hiv_observation date synced to {new_value}")
+                            
+                            # 4. triage_vital_sign is linked by UUID (not date), so it follows clinical record
+                            logger.info(f"✅ All related records synced from {old_date} to {new_value}")
+                    
+                    # --------------------------------------------------------
+                    # UPDATE NEXT APPOINTMENT
+                    # --------------------------------------------------------
+                    elif field_name == "next_appointment":
+                        conn.execute(
+                            text("UPDATE hiv_art_pharmacy SET next_appointment = :val WHERE id = :id"),
+                            {"val": new_value, "id": clean_id}
+                        )
+                        logger.info(f"✅ next_appointment updated to {new_value}")
+                    
+                    # --------------------------------------------------------
+                    # UPDATE MMD TYPE
+                    # --------------------------------------------------------
+                    elif field_name == "mmd_type":
+                        conn.execute(
+                            text("UPDATE hiv_art_pharmacy SET mmd_type = :val WHERE id = :id"),
+                            {"val": new_value, "id": clean_id}
+                        )
+                        logger.info(f"✅ mmd_type updated to {new_value}")
                     
                     else:
                         trans.rollback()
-                        return JSONResponse(
-                            status_code=400,
-                            content={
-                                "success": False,
-                                "detail": f"Invalid refill field: {field_name}. Valid fields: duration, regimen, visit_date, next_appointment, mmd_type"
-                            }
-                        )
+                        return JSONResponse(status_code=400, content={
+                            "success": False,
+                            "detail": f"Invalid refill field: {field_name}. Valid fields: duration, regimen, height, weight, visit_date, next_appointment, mmd_type"
+                        })
                     
                     trans.commit()
                     return {
@@ -1153,10 +1593,9 @@ async def update_emr_record(request: Request):
                 elif record_type == "viral_load":
                     if not record_id:
                         trans.rollback()
-                        return JSONResponse(
-                            status_code=400,
-                            content={"success": False, "detail": "Record ID required"}
-                        )
+                        return JSONResponse(status_code=400, content={
+                            "success": False, "detail": "Record ID required"
+                        })
                     
                     conn.execute(
                         text("UPDATE laboratory_result SET result_reported = :val WHERE id = :id"),
@@ -1172,10 +1611,9 @@ async def update_emr_record(request: Request):
                 
                 else:
                     trans.rollback()
-                    return JSONResponse(
-                        status_code=400,
-                        content={"success": False, "detail": f"Unknown record type: {record_type}"}
-                    )
+                    return JSONResponse(status_code=400, content={
+                        "success": False, "detail": f"Unknown record type: {record_type}"
+                    })
                     
             except Exception as e:
                 trans.rollback()
@@ -1185,11 +1623,7 @@ async def update_emr_record(request: Request):
         logger.error(f"Update error: {e}")
         import traceback
         traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "detail": str(e)}
-        )
-
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
 # ============================================================================
 # REGIMEN LIST
 # ============================================================================
@@ -1987,7 +2421,7 @@ async def debug_raw_regimens(hospital_number: str):
                 text("""
                     SELECT 
                         id,
-                        visit_date,
+                        visit_date::DATE,
                         extra,
                         extra -> 'regimens' AS regimens_raw,
                         jsonb_typeof(extra -> 'regimens') AS regimens_type,
@@ -2694,126 +3128,10 @@ def get_current_regimen_from_record(record):
     return first_pickup.get('regimen', '') or first_pickup.get('regimen_name', '') or 'N/A'
 
 
+
 # ============================================================================
 # EXCEL EXPORT FOR PHARMACY REPORT (FROM DQA)
 # ============================================================================
-
-@app.get("/api/reports/pharmacy/excel")
-async def generate_pharmacy_report_excel(
-    request: Request,
-    start_date: str = None,
-    end_date: str = None
-):
-    """Generate Pharmacy Report as Excel from DQA database"""
-    try:
-        from app.database import dqa_engine
-        from app.models.dqa_models import CareCardRecord
-        from sqlalchemy.orm import Session
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-        
-        user = request.headers.get("X-User", "anonymous")
-        logger.info(f"User '{user}' generating pharmacy Excel from DQA database")
-        
-        with Session(dqa_engine) as session:
-            query = session.query(CareCardRecord)
-            if start_date:
-                query = query.filter(CareCardRecord.verified_at >= start_date)
-            if end_date:
-                query = query.filter(CareCardRecord.verified_at <= end_date)
-            
-            records = query.order_by(CareCardRecord.updated_at.desc()).all()
-        
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Pharmacy Report"
-        
-        # Title
-        ws.merge_cells('A1:L1')
-        ws['A1'] = "MedDQA - Pharmacy Dispensing Report (Care Card Data)"
-        ws['A1'].font = Font(bold=True, size=16, color="1e40af")
-        ws['A1'].alignment = Alignment(horizontal="center")
-        
-        ws.merge_cells('A2:L2')
-        ws['A2'] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Source: DQA Care Card Database"
-        ws['A2'].alignment = Alignment(horizontal="center")
-        
-        # Headers
-        headers = [
-            "S/No", "Facility Name", "DATIM Id", "Patient Id", "Hospital Num",
-            "Date Visit (yyyy-mm-dd)", "Regimen Line", "Regimens",
-            "Refill Period", "MMD_Type", "Next Appointment", "DSD Model"
-        ]
-        
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF", size=10)
-        thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
-        
-        for col, header in enumerate(headers, 1):
-            cell = ws.cell(row=4, column=col, value=header)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = thin_border
-        
-        # Data
-        row_idx = 5
-        sno = 1
-        
-        for record in records:
-            drug_pickups = record.drug_pickups or []
-            
-            for pickup in drug_pickups:
-                regimen_name = pickup.get('regimen', '') or pickup.get('regimen_name', '')
-                duration = pickup.get('duration', 0) or 0
-                pickup_date = pickup.get('pickup_date', '') or 'N/A'
-                regimen_line = categorize_regimen(regimen_name)
-                
-                ws.cell(row=row_idx, column=1, value=sno).border = thin_border
-                ws.cell(row=row_idx, column=2, value=getattr(record, 'facility_name', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=3, value=getattr(record, 'datim_id', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=4, value=record.person_uuid or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=5, value=record.hospital_number or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=6, value=pickup_date).border = thin_border
-                ws.cell(row=row_idx, column=7, value=regimen_line).border = thin_border
-                ws.cell(row=row_idx, column=8, value=regimen_name or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=9, value=duration).border = thin_border
-                ws.cell(row=row_idx, column=10, value=get_mmd_type(duration)).border = thin_border
-                ws.cell(row=row_idx, column=11, value=pickup.get('next_appointment', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=12, value=getattr(record, 'dsd_model', '') or '').border = thin_border
-                
-                row_idx += 1
-                sno += 1
-        
-        # Column widths
-        col_widths = {1: 6, 2: 30, 3: 15, 4: 38, 5: 18, 6: 20, 7: 15, 8: 35, 9: 12, 10: 12, 11: 20, 12: 15}
-        for col, width in col_widths.items():
-            ws.column_dimensions[get_column_letter(col)].width = width
-        
-        ws.freeze_panes = 'A5'
-        
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-        
-        filename = f"Pharmacy_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-        
-    except Exception as e:
-        logger.error(f"Pharmacy Excel error: {e}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-
 
 # ============================================================================
 # EXCEL EXPORT FOR VIRAL LOAD REPORT (FROM DQA)
@@ -2930,6 +3248,694 @@ async def generate_viral_load_report_excel(
         
     except Exception as e:
         logger.error(f"VL Excel error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+    
+
+# ============================================================================
+# LAB SETTINGS API
+# ============================================================================
+
+# ============================================================================
+# LAB SETTINGS API
+# ============================================================================
+
+@app.get("/api/lab/settings")
+async def get_lab_settings(request: Request):
+    """Get current lab settings"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import LabSettings
+        from sqlalchemy.orm import Session
+        
+        with Session(dqa_engine) as session:
+            settings = session.query(LabSettings).order_by(LabSettings.id.desc()).first()
+            
+            if not settings:
+                settings = LabSettings()
+                session.add(settings)
+                session.commit()
+            
+            return {
+                "success": True,
+                "data": {
+                    "id": settings.id,
+                    "pcr_lab_name": settings.pcr_lab_name or "",
+                    "facility_name": settings.facility_name or "",
+                    "clinician_name": settings.clinician_name or "",
+                    "assayed_by_name": settings.assayed_by_name or "",
+                    "approved_by_name": settings.approved_by_name or "",
+                    "collected_by_name": settings.collected_by_name or "",
+                    "auto_fill_dates": settings.auto_fill_dates if hasattr(settings, 'auto_fill_dates') else True
+                }
+            }
+    except Exception as e:
+        logger.error(f"Lab settings error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+
+@app.put("/api/lab/settings")
+async def update_lab_settings(request: Request):
+    """Update lab settings"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import LabSettings
+        from sqlalchemy.orm import Session
+        
+        data = await request.json()
+        user = request.headers.get("X-User", "anonymous")
+        
+        with Session(dqa_engine) as session:
+            settings = session.query(LabSettings).order_by(LabSettings.id.desc()).first()
+            
+            if not settings:
+                settings = LabSettings()
+                session.add(settings)
+            
+            if 'pcr_lab_name' in data:
+                settings.pcr_lab_name = data['pcr_lab_name']
+            if 'facility_name' in data:
+                settings.facility_name = data['facility_name']
+            if 'clinician_name' in data:
+                settings.clinician_name = data['clinician_name']
+            if 'assayed_by_name' in data:
+                settings.assayed_by_name = data['assayed_by_name']
+            if 'approved_by_name' in data:
+                settings.approved_by_name = data['approved_by_name']
+            if 'collected_by_name' in data:
+                settings.collected_by_name = data['collected_by_name']
+            
+            settings.updated_by = user
+            settings.updated_at = datetime.now()
+            
+            session.commit()
+            
+            return {"success": True, "message": "Lab settings updated successfully"}
+            
+    except Exception as e:
+        logger.error(f"Update lab settings error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+# ============================================================================
+# VL RESULT FORMATTING & PDF GENERATION - COMPLETE FULL CODE
+# ============================================================================
+
+def clean_regimen_name(name):
+    """
+    Clean regimen name for display.
+    Converts "TDF(300mg)/3TC(300mg)/DTG(50mg)" → "TDF-3TC-DTG"
+    Removes dosage in parentheses and replaces / with -
+    """
+    if not name or name == "Unknown":
+        return "N/A"
+    
+    import re
+    # Remove anything in parentheses like (300mg), (50mg), (INH)
+    cleaned = re.sub(r'\([^)]*\)', '', name)
+    # Replace / with -
+    cleaned = cleaned.replace('/', '-')
+    # Clean up multiple dashes
+    cleaned = re.sub(r'-+', '-', cleaned)
+    # Remove leading/trailing dashes and spaces
+    cleaned = cleaned.strip('-').strip()
+    
+    return cleaned if cleaned else "N/A"
+
+
+def format_vl_for_print(vl_value):
+    """
+    Format VL result for printing.
+    - 0 or TND → "TND"
+    - 1-20 → "<20"
+    - 21+ → actual number
+    """
+    if not vl_value or vl_value == 'N/A':
+        return 'N/A'
+    
+    vl_str = str(vl_value).strip().upper()
+    
+    # TND / Not Detected / Zero
+    if vl_str in ['TND', 'NOT DETECTED', 'UNDETECTABLE', '0', '0.0']:
+        return 'TND'
+    
+    # Already has < sign - only keep if it's <20 or less
+    if vl_str.startswith('<'):
+        try:
+            num = int(float(vl_str[1:].strip().replace(',', '')))
+            if num == 0:
+                return 'TND'
+            if num <= 20:
+                return '<20'
+            # If >20, just return the number without <
+            return str(num)
+        except (ValueError, TypeError):
+            return 'N/A'
+    
+    # Numeric values
+    try:
+        num = int(float(vl_str.replace(',', '')))
+        if num == 0:
+            return 'TND'
+        if num <= 20:
+            return '<20'
+        return str(num)
+    except (ValueError, TypeError):
+        return 'N/A'
+
+
+# ============================================================================
+# VL RESULT FORMATTING & PDF GENERATION - COMPLETE FULL CODE
+# ALL BOXES PROPERLY PLACED - 100% COMPLETE
+# ============================================================================
+
+def clean_regimen_name(name):
+    """
+    Clean regimen name for display.
+    Converts "TDF(300mg)/3TC(300mg)/DTG(50mg)" → "TDF-3TC-DTG"
+    Removes dosage in parentheses and replaces / with -
+    """
+    if not name or name == "Unknown":
+        return "N/A"
+    
+    import re
+    cleaned = re.sub(r'\([^)]*\)', '', name)
+    cleaned = cleaned.replace('/', '-')
+    cleaned = re.sub(r'-+', '-', cleaned)
+    cleaned = cleaned.strip('-').strip()
+    
+    return cleaned if cleaned else "N/A"
+
+
+def format_vl_for_print(vl_value):
+    """
+    Format VL result for printing.
+    - 0 or TND → "TND"
+    - 1-20 → "<20"
+    - 21+ → actual number
+    """
+    if not vl_value or vl_value == 'N/A':
+        return 'N/A'
+    
+    vl_str = str(vl_value).strip().upper()
+    
+    if vl_str in ['TND', 'NOT DETECTED', 'UNDETECTABLE', '0', '0.0']:
+        return 'TND'
+    
+    if vl_str.startswith('<'):
+        try:
+            num = int(float(vl_str[1:].strip().replace(',', '')))
+            if num == 0: return 'TND'
+            if num <= 20: return '<20'
+            return str(num)
+        except: return 'N/A'
+    
+    try:
+        num = int(float(vl_str.replace(',', '')))
+        if num == 0: return 'TND'
+        if num <= 20: return '<20'
+        return str(num)
+    except: return 'N/A'
+
+
+def create_vl_pdf(data):
+    """
+    Create VL Result PDF matching UDUTH form template.
+    100% Complete - All boxes properly placed.
+    """
+    import tempfile
+    import os
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    
+    path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+    c = canvas.Canvas(path, pagesize=A4)
+    width, height = A4
+
+    def box(x, y, w, h):
+        """Draw a rectangle box"""
+        c.rect(x, y, w, h, stroke=1, fill=0)
+
+    def text(txt, x, y, size=9, bold=False):
+        """Draw text at position"""
+        if txt is None: txt = ""
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        c.drawString(x, y, str(txt))
+
+    def text_center(txt, y, size=9, bold=False):
+        """Draw centered text"""
+        if txt is None: txt = ""
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        c.drawCentredString(width / 2, y, str(txt))
+
+    def text_right(txt, x, y, size=9, bold=False):
+        """Draw right-aligned text"""
+        if txt is None: txt = ""
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        c.drawRightString(x, y, str(txt))
+
+    # ========================================================================
+    # START POSITION
+    # ========================================================================
+    y = height - 35
+
+    # ========================================================================
+    # HEADER WITH LOGO
+    # ========================================================================
+    logo_path = resource_path(os.path.join("app", "static", "logo.png"))
+    
+    if os.path.exists(logo_path):
+        try:
+            logo = ImageReader(logo_path)
+            c.drawImage(logo, 35, y - 30, width=50, height=42, preserveAspectRatio=True, mask='auto')
+        except:
+            box(35, y - 30, 50, 42)
+    else:
+        box(35, y - 30, 50, 42)
+
+    # Title centered on page
+    text_center("VIRAL LOAD ORDER AND RESULTS FORM", y, 16, True)
+    text_center(data.get("pcr_lab_name", "UDUTH Testing Lab"), y - 18, 12, True)
+    
+    y -= 55
+
+    # ========================================================================
+    # FACILITY NAME & STATE
+    # ========================================================================
+    text("FACILITY NAME:", 40, y, 9, True)
+    box(130, y - 12, 320, 16)
+    text(data.get("facility_name", ""), 135, y - 10, 8)
+    
+    y -= 25
+
+    text("STATE:", 40, y, 9, True)
+    box(130, y - 12, 320, 16)
+    text(data.get("state", ""), 135, y - 10, 8)
+    
+    y -= 35
+
+    # ========================================================================
+    # PATIENT NAME - SURNAME + OTHER NAMES
+    # ========================================================================
+    text("PATIENT NAME", 40, y, 9, True)
+
+    # Surname box
+    box(40, y - 22, 250, 18)
+    text(data.get("surname", ""), 45, y - 19, 9)
+    text("Surname", 45, y - 35, 7)
+
+    # Other names box
+    other_names = data.get("other_names", "")
+    box(300, y - 22, 250, 18)
+    text(other_names, 305, y - 19, 9)
+    text("Other name(s)", 305, y - 35, 7)
+    
+    y -= 48
+
+    # ========================================================================
+    # SEX / AGE / PREGNANT / BREASTFEEDING - ALL IN ONE ROW
+    # ========================================================================
+    row_y = y
+
+    # Male checkbox
+    box(40, row_y - 4, 12, 12)
+    if str(data.get("gender", "")).lower() == "male":
+        text("X", 43, row_y - 6, 10, True)
+    text("Male", 56, row_y - 3, 8)
+
+    # Female checkbox
+    box(100, row_y - 4, 12, 12)
+    if str(data.get("gender", "")).lower() == "female":
+        text("X", 103, row_y - 6, 10, True)
+    text("Female", 116, row_y - 3, 8)
+
+    # Age
+    text("Age", 170, row_y - 3, 8)
+    box(195, row_y - 6, 35, 16)
+    text(data.get("age", ""), 200, row_y - 3, 9)
+    text("Years", 235, row_y - 3, 8)
+
+    # Under 2 years
+    box(280, row_y - 4, 12, 12)
+    text("< 2 years", 296, row_y - 3, 7)
+
+    # Months
+    box(350, row_y - 6, 30, 16)
+    text("Months", 384, row_y - 3, 7)
+
+    # Pregnant
+    box(430, row_y - 4, 12, 12)
+    text("Pregnant", 446, row_y - 3, 7)
+
+    # Breastfeeding
+    box(500, row_y - 4, 12, 12)
+    text("Breastfeeding", 516, row_y - 3, 7)
+
+    y -= 35
+
+    # ========================================================================
+    # IDENTIFICATION NUMBERS
+    # ========================================================================
+    text("ID", 40, y, 9, True)
+    box(40, y - 20, 180, 18)
+    text(data.get("unique_id", data.get("hospital_number", "")), 45, y - 17, 9)
+    text("Client's Unique Number", 45, y - 34, 7)
+
+    text("HOSPITAL (UNIT) NO.", 235, y, 9, True)
+    box(235, y - 20, 180, 18)
+    text(data.get("hospital_number", ""), 240, y - 17, 9)
+
+    text("LAB REGISTRATION NO.", 430, y, 9, True)
+    box(430, y - 20, 120, 18)
+    text(str(data.get("lab_sample_no", "")), 435, y - 17, 9)
+    
+    y -= 45
+
+    # ========================================================================
+    # SAMPLE TYPE
+    # ========================================================================
+    text("SAMPLE TYPE:", 40, y, 9, True)
+    text("Plasma", 140, y, 9)
+    
+    y -= 25
+
+    # ========================================================================
+    # INDICATION FOR VL TEST BOX
+    # ========================================================================
+    box(40, y - 105, width - 80, 105)
+    
+    text("INDICATION FOR VIRAL LOAD TEST", 50, y - 20, 9, True)
+    text("Routine (every >12 months)", 50, y - 40, 8)
+    text("Others", 50, y - 55, 8)
+
+    # ART Commencement Date
+    text("ART Commencement Date", 320, y - 20, 9, True)
+    box(320, y - 40, 150, 18)
+    text(data.get("art_start_date", ""), 325, y - 36, 8)
+    text("DD/MM/YY", 360, y - 55, 7)
+
+    # Drug Regimen
+    text("DRUG REGIMEN", 320, y - 65, 9, True)
+    regimen = data.get("regimen", "N/A")
+    text(regimen, 320, y - 82, 9)
+
+    y -= 120
+
+    # ========================================================================
+    # DISCLAIMER
+    # ========================================================================
+    c.setFont("Helvetica", 7)
+    c.drawString(40, y, "Tests will only be performed at the oratory, if all fields above are filled in correctly and signed below by the ordering staff")
+    
+    y -= 18
+
+    # ========================================================================
+    # COLLECTED BY & SIGNATURE
+    # ========================================================================
+    text("Collected by:", 40, y, 9, True)
+    text(data.get("collected_by", ""), 125, y, 9)
+    
+    c.setFont("Helvetica", 7)
+    c.drawCentredString(220, y - 28, "Print Name")
+
+    text("Signature", 370, y, 9, True)
+    
+    y -= 35
+
+    # Collection Date & Time
+    text("Collection Date:", 370, y, 9, True)
+    text(data.get("collection_date", ""), 470, y, 9)
+
+    text("Collection Time:", 370, y - 15, 9, True)
+    text(data.get("collection_time", "10:00 AM"), 470, y - 15, 9)
+
+    y -= 45
+
+    # ========================================================================
+    # HORIZONTAL SEPARATOR
+    # ========================================================================
+    c.setLineWidth(1.5)
+    c.line(40, y, width - 40, y)
+    
+    y -= 25
+
+    # ========================================================================
+    # RESULTS SECTION
+    # ========================================================================
+    text_center("RESULTS", y, 13, True)
+    
+    y -= 30
+
+    # Date Received & Time
+    text("DATE RECEIVED AT PCR LAB", 40, y, 9, True)
+    text(data.get("received_date", ""), 190, y, 9)
+
+    text("TIME", 370, y, 9, True)
+    text(data.get("received_time", "10:00 AM"), 470, y, 9)
+
+    y -= 30
+
+    # RESULT VALUE + PCR LAB NAME (same row)
+    text("RESULTS", 40, y, 9, True)
+    box(90, y - 16, 180, 22)
+    
+    result_value = data.get("result_value", "N/A")
+    if result_value in ['TND', 'N/A']:
+        display_text = result_value
+    else:
+        display_text = f"{result_value} copies/ml"
+    
+    text(display_text, 100, y - 11, 11, True)
+
+    text("PCR LAB NAME", 320, y, 9, True)
+    text(data.get("pcr_lab_name", "UDUTH Testing Lab"), 420, y, 9)
+
+    y -= 35
+
+    # PCR LAB SAMPLE NO
+    text("PCR LAB SAMPLE NO.", 320, y, 9, True)
+    text(str(data.get("", "")), 450, y, 9)
+
+    y -= 25
+
+    # ========================================================================
+    # RESULT INTERPRETATION BOXES
+    # ========================================================================
+    box(40, y - 40, 130, 35)
+    text("Result Interpretation", 50, y - 28, 8, True)
+
+    box(210, y - 40, 120, 35)
+    c.setFont("Helvetica", 7)
+    c.drawString(215, y - 28, "Viral suppression")
+    c.drawString(215, y - 38, "<1000 c/ml")
+
+    box(350, y - 40, 120, 35)
+    c.setFont("Helvetica", 7)
+    c.drawString(355, y - 28, "Poor suppression")
+    c.drawString(355, y - 38, "1000-10000 c/ml")
+
+    box(490, y - 40, 100, 35)
+    c.setFont("Helvetica", 7)
+    c.drawString(495, y - 28, "Critical values")
+    c.drawString(495, y - 38, ">10000 c/ml")
+
+    y -= 60
+
+        # ========================================================================
+    # SIGNATURES SECTION - COMPACT WITH NAME + DATE ON SAME LINE
+    # ========================================================================
+    box(40, y - 55, width - 80, 55)
+    
+    # Vertical dividers
+    c.line(210, y, 210, y - 55)
+    c.line(380, y, 380, y - 55)
+
+    # Names and dates on ONE line
+    clinician_date = data.get("clinician_date", data.get("collection_date", ""))
+    assayed_date = data.get("assayed_date", data.get("result_date", ""))
+    approved_date = data.get("approved_date", data.get("result_date", ""))
+
+    c.setFont("Helvetica-Bold", 7)
+    c.drawString(50, y - 15, f"{data.get('clinician_name', '')}")
+    c.drawString(220, y - 15, f"{data.get('assayed_by_name', '')}")
+    c.drawString(390, y - 15, f"{data.get('approved_by_name', '')}")
+    y -=15
+
+    c.setFont("Helvetica", 7)
+    c.drawString(100, y, f"{clinician_date}")
+    c.drawString(280, y, f"{assayed_date}")
+    c.drawString(490, y, f"{approved_date}")
+    y -=-20
+    # Column headers at the bottom
+    c.setFont("Helvetica", 9)
+    c.drawString(55, y - 38, "Clinician-Date")
+    c.drawString(235, y - 38, "Assayed By-Date")
+    c.drawString(395, y - 38, "Reviewed-Approved-Date")
+
+    # ========================================================================
+    # FOOTER
+    # ========================================================================
+    c.setFont("Helvetica", 7)
+    c.drawCentredString(width / 2, 30, "Copyright © 2020 Federal Ministry of Health, Nigeria. All rights reserved.")
+
+    c.save()
+    return path
+
+
+# ============================================================================
+# VL RESULT PRINT API
+# ============================================================================
+
+@app.get("/api/vl/print/{hospital_number:path}/{sample_date}")
+async def print_vl_result(hospital_number: str, sample_date: str, request: Request):
+    """Generate VL Result PDF"""
+    try:
+        from app.database import emr_engine, dqa_engine
+        from app.models.dqa_models import LabSettings
+        from sqlalchemy.orm import Session
+        
+        hospital_number = unquote(hospital_number)
+        sample_date = unquote(sample_date)
+        
+        logger.info(f"🖨️ Printing VL result for {hospital_number} on {sample_date}")
+        
+        patient_result = None
+        vl_result = None
+        current_regimen = "N/A"
+        
+        # ALL EMR QUERIES INSIDE ONE WITH BLOCK
+        with emr_engine.connect() as conn:
+            # Get patient info
+            patient_result = conn.execute(
+                text("""
+                    SELECT 
+                        p.first_name, p.surname, p.other_name,
+                        INITCAP(p.sex) AS sex,
+                        EXTRACT(YEAR FROM AGE(CURRENT_DATE, p.date_of_birth)) AS age,
+                        p.date_of_birth, p.hospital_number,
+                        h.date_of_registration AS art_start_date,
+                        facility.name AS facility_name,
+                        facility_state.name AS state,
+                        h.unique_id
+                    FROM patient_person p
+                    INNER JOIN hiv_enrollment h ON h.person_uuid = p.uuid AND h.archived = 0
+                    INNER JOIN base_organisation_unit facility ON facility.id = h.facility_id
+                    INNER JOIN base_organisation_unit facility_lga ON facility_lga.id = facility.parent_organisation_unit_id
+                    INNER JOIN base_organisation_unit facility_state ON facility_state.id = facility_lga.parent_organisation_unit_id
+                    WHERE p.hospital_number = :hn AND p.archived = 0 LIMIT 1
+                """),
+                {"hn": hospital_number}
+            ).fetchone()
+            
+            # Get VL result
+            vl_result = conn.execute(
+                text("""
+                    SELECT 
+                        CAST(ls.date_sample_collected AS DATE) AS sample_date,
+                        sm.result_reported AS vl_result,
+                        CAST(sm.date_result_reported AS DATE) AS result_date,
+                        COALESCE(ls.sample_number, ls.uuid::text) AS lab_sample_no
+                    FROM laboratory_result sm
+                    INNER JOIN laboratory_test lt ON lt.id = sm.test_id
+                    INNER JOIN laboratory_sample ls ON ls.test_id = lt.id
+                    WHERE lt.lab_test_id = 16
+                    AND sm.patient_uuid = (SELECT uuid FROM patient_person WHERE hospital_number = :hn AND archived = 0)
+                    AND CAST(ls.date_sample_collected AS DATE) = CAST(:sd AS DATE)
+                    AND sm.result_reported IS NOT NULL AND sm.archived = 0
+                    LIMIT 1
+                """),
+                {"hn": hospital_number, "sd": sample_date}
+            ).fetchone()
+            
+            # Get current regimen
+            try:
+                cr = conn.execute(
+                    text("""
+                        SELECT elem.value ->> 'regimenName' AS regimen
+                        FROM hiv_art_pharmacy hap
+                        CROSS JOIN LATERAL jsonb_array_elements(hap.extra -> 'regimens') WITH ORDINALITY AS elem(value, ordinality)
+                        WHERE hap.person_uuid = (SELECT uuid FROM patient_person WHERE hospital_number = :hn AND archived = 0)
+                        AND hap.archived = 0 AND elem.ordinality = 1
+                        ORDER BY hap.visit_date DESC LIMIT 1
+                    """),
+                    {"hn": hospital_number}
+                ).fetchone()
+                if cr and cr[0]:
+                    current_regimen = cr[0]
+                logger.info(f"✅ Current regimen for PDF: {current_regimen}")
+            except Exception as e:
+                logger.warning(f"Could not get regimen for PDF: {e}")
+        
+        if not patient_result:
+            return JSONResponse(status_code=404, content={"success": False, "detail": "Patient not found"})
+        
+        if not vl_result:
+            return JSONResponse(status_code=404, content={"success": False, "detail": f"VL result not found for date: {sample_date}"})
+        
+        # Get lab settings
+        lab_settings = None
+        try:
+            with Session(dqa_engine) as session:
+                lab_settings = session.query(LabSettings).order_by(LabSettings.id.desc()).first()
+        except:
+            pass
+        
+        # Format VL result
+        vl_value = str(vl_result[1]).strip() if vl_result[1] else 'N/A'
+        vl_display = format_vl_for_print(vl_value)
+        
+        # Generate lab numbers
+        lab_reg = abs(hash(str(patient_result[6]) + str(sample_date))) % 100000
+        lab_sample_no = str(vl_result[3]) if vl_result[3] else str(abs(hash(str(vl_result[0]) + str(vl_result[1]))) % 100000)
+        
+        
+        # Build PDF data
+        pdf_data = {
+            "facility_name": (lab_settings.facility_name if lab_settings and lab_settings.facility_name else (patient_result[8] or 'N/A')),
+            "state": patient_result[9] or 'N/A',
+            "surname": patient_result[1] or '',
+            "first_name": patient_result[0] or '',
+            "other_name": patient_result[2] or '',
+            "other_names": f"{patient_result[0] or ''} {patient_result[2] or ''}".strip(),
+            "gender": patient_result[3] or '',
+            "age": str(int(patient_result[4])) if patient_result[4] else '',
+            "hospital_number": patient_result[6] or '',
+            "unique_id": patient_result[10] or '',
+            "art_start_date": str(patient_result[7])[:10] if patient_result[7] else '',
+            "regimen": clean_regimen_name(current_regimen),
+            "collection_date": str(vl_result[0]) if vl_result[0] else '',
+            "result_value": vl_display,
+            "received_date": str(vl_result[0]) if vl_result[0] else '',
+            "received_time": "10:00 AM",
+            "result_date": str(vl_result[2]) if vl_result[2] else '',
+            "lab_reg_no": str(lab_reg),
+            "lab_sample_no": lab_sample_no,
+            "pcr_lab_name": lab_settings.pcr_lab_name if lab_settings else "UDUTH Testing Lab",
+            "clinician_name": lab_settings.clinician_name if lab_settings else "",
+            "assayed_by_name": lab_settings.assayed_by_name if lab_settings else "",
+            "approved_by_name": lab_settings.approved_by_name if lab_settings else "",
+            "clinician_date": str(vl_result[0]) if vl_result[0] else '',
+            "assayed_date": str(vl_result[2]) if vl_result[2] else '',
+            "approved_date": str(vl_result[2]) if vl_result[2] else '',
+            "collected_by": lab_settings.collected_by_name if lab_settings else "",
+            "collection_time": "10:00 AM",
+        }
+        
+        logger.info(f"PDF data regimen: {pdf_data['regimen']}")
+        
+        # Generate PDF
+        pdf_path = create_vl_pdf(pdf_data)
+        
+        return FileResponse(
+            pdf_path,
+            media_type="application/pdf",
+            filename=f"VL_Result_{hospital_number.replace('/', '_')}_{sample_date}.pdf"
+        )
+        
+    except Exception as e:
+        logger.error(f"Print VL error: {e}")
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
