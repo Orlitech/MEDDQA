@@ -5,7 +5,7 @@ Multi-User | Real-Time | Professional
 100% COMPLETE - All Features Included
 """
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, FileResponse
@@ -16,12 +16,15 @@ from sqlalchemy import text
 from datetime import datetime, date, timedelta
 from urllib.parse import unquote
 from openpyxl.utils import get_column_letter
+from sqlalchemy.orm import Session
 import logging
 import json
 import secrets
 import io
 import os
 import sys
+import hashlib
+from sqlalchemy import cast, Date
 
 # ============================================================================
 # PATH SETUP
@@ -124,32 +127,6 @@ def get_database_connections():
     except Exception as e:
         logger.warning(f"Database connections not available: {e}")
         return None, None
-
-# ============================================================================
-# MIDDLEWARE
-# ============================================================================
-
-@app.middleware("http")
-async def setup_middleware(request: Request, call_next):
-    """Middleware to check setup status and track active users"""
-    # Paths that don't require setup
-    allowed_paths = [
-        '/setup', '/api/setup', '/static', '/health',
-        '/api/debug', '/api/schema', '/favicon.ico'
-    ]
-    
-    if any(request.url.path.startswith(p) for p in allowed_paths):
-        return await call_next(request)
-    
-    if not is_setup_complete():
-        return RedirectResponse(url='/setup', status_code=302)
-    
-    # Track active user
-    user = request.headers.get("X-User", "anonymous")
-    if user and user != "anonymous":
-        active_sessions[user] = datetime.now()
-    
-    return await call_next(request)
 
 # ============================================================================
 # MAIN PAGES
@@ -559,7 +536,7 @@ async def search_patient(hospital_number: str, request: Request):
                             INITCAP(p.sex) AS sex,
                             p.date_of_birth,
                             p.date_of_registration AS date_enrolled,
-                            h.date_of_registration AS art_start_date,
+                            COALESCE(hac.visit_date::DATE, h.date_of_registration) AS art_start_date,
                             facility.name AS facility_name,
                             facility_lga.name AS lga,
                             facility_state.name AS state,
@@ -569,6 +546,8 @@ async def search_patient(hospital_number: str, request: Request):
                         INNER JOIN base_organisation_unit facility ON facility.id = h.facility_id
                         INNER JOIN base_organisation_unit facility_lga ON facility_lga.id = facility.parent_organisation_unit_id
                         INNER JOIN base_organisation_unit facility_state ON facility_state.id = facility_lga.parent_organisation_unit_id
+                        LEFT JOIN hiv_art_clinical hac ON hac.hiv_enrollment_uuid = h.uuid 
+                        AND hac.archived = 0 AND hac.is_commencement = TRUE
                         WHERE TRIM(p.hospital_number) ILIKE TRIM(:hn) AND p.archived = 0
                         LIMIT 1
                     """),
@@ -1406,6 +1385,9 @@ async def update_emr_record(request: Request):
                     # UPDATE REGIMEN NAME - Target specific drug by regimenId
                     # --------------------------------------------------------
                     elif field_name == "regimen":
+                        # ✅ Convert to proper JSON string first
+                        regimen_json = json.dumps(str(new_value))  # This wraps in quotes: "TAF(25mg)..."
+                        
                         if target_regimen_id:
                             conn.execute(
                                 text("""
@@ -1417,7 +1399,7 @@ async def update_emr_record(request: Request):
                                             SELECT jsonb_agg(
                                                 CASE 
                                                     WHEN (elem ->> 'regimenId') = :rid 
-                                                    THEN jsonb_set(elem, '{regimenName}', to_jsonb(:rn))
+                                                    THEN elem || jsonb_build_object('regimenName', CAST(:rn AS jsonb))
                                                     ELSE elem
                                                 END
                                             )
@@ -1428,7 +1410,7 @@ async def update_emr_record(request: Request):
                                     AND extra -> 'regimens' IS NOT NULL
                                     AND jsonb_typeof(extra -> 'regimens') = 'array'
                                 """),
-                                {"rn": str(new_value), "id": clean_id, "rid": target_regimen_id}
+                                {"rn": regimen_json, "id": clean_id, "rid": str(target_regimen_id)}
                             )
                         else:
                             conn.execute(
@@ -1438,13 +1420,15 @@ async def update_emr_record(request: Request):
                                         extra,
                                         '{regimens}',
                                         (
-                                            SELECT jsonb_agg(jsonb_set(elem, '{regimenName}', to_jsonb(:rn)))
+                                            SELECT jsonb_agg(
+                                                elem || jsonb_build_object('regimenName', CAST(:rn AS jsonb))
+                                            )
                                             FROM jsonb_array_elements(extra -> 'regimens') AS elem
                                         )
                                     )
                                     WHERE id = :id
                                 """),
-                                {"rn": str(new_value), "id": clean_id}
+                                {"rn": regimen_json, "id": clean_id}
                             )
                         
                         logger.info(f"✅ Regimen updated to '{new_value}' for regimen_id={target_regimen_id}")
@@ -1591,24 +1575,16 @@ async def update_emr_record(request: Request):
                 # VIRAL LOAD UPDATE
                 # ============================================================
                 elif record_type == "viral_load":
-                    if not record_id:
-                        trans.rollback()
-                        return JSONResponse(status_code=400, content={
-                            "success": False, "detail": "Record ID required"
-                        })
-                    
-                    conn.execute(
-                        text("UPDATE laboratory_result SET result_reported = :val WHERE id = :id"),
-                        {"val": new_value, "id": record_id}
+                    trans.rollback()
+
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "success": False,
+                            "detail": "Use /api/patients/update-vl for Viral Load updates"
+                        }
                     )
                     
-                    trans.commit()
-                    return {
-                        "success": True,
-                        "message": "Viral load updated successfully",
-                        "updated_by": user
-                    }
-                
                 else:
                     trans.rollback()
                     return JSONResponse(status_code=400, content={
@@ -1679,37 +1655,6 @@ async def get_regimens():
         logger.error(f"Regimen list error: {e}")
         return get_fallback_regimens()
 
-
-def categorize_regimen(name):
-    """Categorize a regimen based on its drug components"""
-    name_lower = name.lower()
-    
-    # Anti-TB drugs
-    tb_drugs = ['isoniazid', 'inh', '3hp', 'rifampicin', 'rifampin', 'pyrazinamide', 
-                'ethambutol', 'rhze', 'rhz', 'tb', 'rifinah', 'akurit']
-    for tb in tb_drugs:
-        if tb in name_lower:
-            return 'Anti-TB'
-    
-    # Prophylaxis drugs
-    prophylaxis_drugs = ['cotrimoxazole', 'septrin', 'bactrim', 'fluconazole', 
-                         'dapsone', 'azithromycin']
-    for proph in prophylaxis_drugs:
-        if proph in name_lower:
-            return 'Prophylaxis'
-    
-    # Other common non-ARV drugs
-    other_drugs = ['pyridoxine', 'vitamin', 'folic', 'ferrous', 'paracetamol', 
-                   'ibuprofen', 'amitriptyline', 'amoxicillin', 'metronidazole',
-                   'omeprazole', 'hydrochlorothiazide', 'amlodipine']
-    for other in other_drugs:
-        if other in name_lower:
-            return 'Other'
-    
-    # Everything else is ARV
-    return 'ARVs'
-
-
 def get_fallback_regimens():
     """Fallback regimens when database is not available"""
     return {
@@ -1738,7 +1683,6 @@ def get_fallback_regimens():
 # ============================================================================
 # CARE CARD SAVE & LOAD
 # ============================================================================
-
 @app.post("/api/care-cards/save")
 async def save_care_card_data(request: Request):
     """Save care card data for a patient"""
@@ -1826,11 +1770,14 @@ async def load_care_card_data(hospital_number: str, request: Request):
                         "hospital_number": record.hospital_number,
                         "drug_pickups": record.drug_pickups or [],
                         "viral_loads": record.viral_loads or [],
+                        "enrollment_data": record.enrollment_data or {},
                         "created_by": record.created_by,
                         "updated_by": record.updated_by,
                         "created_at": str(record.created_at) if record.created_at else None,
                         "updated_at": str(record.updated_at) if record.updated_at else None,
-                        "is_verified": record.is_verified
+                        "is_verified": record.is_verified,
+                        "verified_by": record.verified_by,
+                        "verified_at": str(record.verified_at) if record.verified_at else None
                     }
                 }
             else:
@@ -1842,7 +1789,7 @@ async def load_care_card_data(hospital_number: str, request: Request):
             status_code=500,
             content={"success": False, "detail": str(e)}
         )
-
+    
 # ============================================================================
 # CARE CARD COMPARISON
 # ============================================================================
@@ -2025,14 +1972,13 @@ async def compare_care_card(request: Request):
             status_code=500,
             content={"success": False, "detail": str(e)}
         )
-
 # ============================================================================
 # DQA SUBMISSION
 # ============================================================================
 
 @app.post("/api/care-cards/submit")
 async def submit_care_card(request: Request):
-    """Submit DQA verification data"""
+    """Submit DQA verification data with full correction details"""
     try:
         from app.database import dqa_engine
         from app.models.dqa_models import DQAAuditLog, CareCardRecord
@@ -2210,7 +2156,7 @@ async def generate_excel_report(request: Request):
             
             for row_idx, record in enumerate(records, 5):
                 ws_summary.cell(row=row_idx, column=1, value=record.hospital_number)
-                ws_summary.cell(row=row_idx, column=2, value=f"{getattr(record, 'first_name', '')} {getattr(record, 'surname', '')}".strip())
+                ws_summary.cell(row=row_idx, column=2, value=record.created_by or '')
                 ws_summary.cell(row=row_idx, column=3, value=len(record.drug_pickups or []))
                 ws_summary.cell(row=row_idx, column=4, value=len(record.viral_loads or []))
                 ws_summary.cell(row=row_idx, column=5, value="Yes" if record.is_verified else "No")
@@ -2532,30 +2478,32 @@ async def generate_pharmacy_report_excel(
     start_date: str = None,
     end_date: str = None
 ):
-    """Generate Pharmacy Report Excel - fetches data directly"""
+    """
+    Generate Comprehensive DQA Match Report Excel
+    """
     try:
         from app.database import dqa_engine, emr_engine
         from app.models.dqa_models import CareCardRecord
         from sqlalchemy.orm import Session
+        from sqlalchemy import text
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
+        from datetime import datetime
+        import io
         
         user = request.headers.get("X-User", "anonymous")
-        logger.info(f"User '{user}' generating pharmacy Excel report")
+        logger.info(f"📊 User '{user}' generating comprehensive DQA report")
         
-        # Clean parameters - handle empty strings
         if start_date and start_date.strip():
             start_date = start_date.strip()
         else:
             start_date = None
-        
         if end_date and end_date.strip():
             end_date = end_date.strip()
         else:
             end_date = None
         
-        # Cache for EMR facility data
         facility_cache = {}
         
         def get_facility_info(hospital_number):
@@ -2584,107 +2532,216 @@ async def generate_pharmacy_report_excel(
             facility_cache[hospital_number] = info
             return info
         
-        # Fetch DQA data
+        def get_status_display(results_list, field_name):
+            if not results_list:
+                return "—"
+            for r in results_list:
+                if r.get("field") == field_name:
+                    if r.get("match"):
+                        return "✅ Match"
+                    corrected = r.get("corrected_on", "")
+                    if corrected == "emr":
+                        return "💻 Corrected (EMR)"
+                    elif corrected == "care_card":
+                        return "📋 Corrected (Card)"
+                    elif corrected == "both":
+                        return "🔀 Corrected (Both)"
+                    return "⚠️ Mismatch"
+            return "—"
+        
         with Session(dqa_engine) as session:
-            query = session.query(CareCardRecord)
+            query = session.query(CareCardRecord).filter(CareCardRecord.is_verified == True)
             
-            # Only filter if dates are provided and not empty
             if start_date:
                 query = query.filter(CareCardRecord.verified_at >= start_date)
             if end_date:
-                query = query.filter(CareCardRecord.verified_at <= end_date)
+                query = query.filter(CareCardRecord.verified_at <= end_date + "T23:59:59")
             
-            records = query.order_by(CareCardRecord.updated_at.desc()).all()
+            records = query.order_by(CareCardRecord.verified_at.desc()).all()
         
-        # Build pharmacy data
-        pharmacy_data = []
+        logger.info(f"📊 Found {len(records)} verified records")
+        
+        report_data = []
         sno = 1
         
         for record in records:
             facility_info = get_facility_info(record.hospital_number)
             
-            for pickup in (record.drug_pickups or []):
-                regimen_name = pickup.get('regimen', '') or pickup.get('regimen_name', '')
-                duration = pickup.get('duration', 0) or 0
-                
-                pharmacy_data.append({
-                    "s_no": sno,
-                    "facility_name": facility_info['facility_name'],
-                    "datim_id": facility_info['datim_id'],
-                    "patient_id": record.person_uuid or 'N/A',
-                    "hospital_num": record.hospital_number or 'N/A',
-                    "date_visit": pickup.get('pickup_date', 'N/A') or 'N/A',
-                    "regimen_line": categorize_regimen(regimen_name),
-                    "regimens": regimen_name or 'N/A',
-                    "refill_period": duration,
-                    "mmd_type": get_mmd_type(duration),
-                    "next_appointment": pickup.get('next_appointment', 'N/A') or 'N/A',
-                    "dsd_model": getattr(record, 'dsd_model', '') or ''
-                })
-                sno += 1
+            ed = record.enrollment_data or {}
+            biodata_results = ed.get("biodata_verification", [])
+            latest_refill_results = ed.get("latest_refill_verification", [])
+            drug_pickups = record.drug_pickups or []
+            viral_loads = record.viral_loads or []
+            
+            report_data.append({
+                "s_no": sno,
+                "facility_name": facility_info['facility_name'],
+                "datim_id": facility_info['datim_id'],
+                "patient_uuid": record.person_uuid or 'N/A',
+                "hospital_number": record.hospital_number or 'N/A',
+                "sex_status": get_status_display(biodata_results, "sex"),
+                "dob_status": get_status_display(biodata_results, "date_of_birth"),
+                "art_start_status": get_status_display(biodata_results, "art_start_date"),
+                "pickup_status": get_status_display(latest_refill_results, "last_pickup_date"),
+                "duration_status": get_status_display(drug_pickups, "refill_durations"),
+                "vl_sample_date": get_status_display(viral_loads, "vl_sample_dates"),
+                "vl_result_status": get_status_display(viral_loads, "vl_results"),
+                "vl_result_date_status": get_status_display(viral_loads, "vl_result_dates"),
+                "verified_by": record.verified_by or record.created_by or 'N/A',
+                "verified_at": record.verified_at.date() if record.verified_at else None
+            })
+            sno += 1
         
-        logger.info(f"Pharmacy Excel: {len(pharmacy_data)} rows")
-        
-        # Create Excel
+        # ================================================================
+        # CREATE EXCEL - Headers only, no title/summary rows
+        # ================================================================
         wb = Workbook()
         ws = wb.active
-        ws.title = "Pharmacy Report"
+        ws.title = "DQA Match Report"
         
-        headers = [
-            "S/No", "Facility Name", "DATIM Id", "Patient Id", "Hospital Num",
-            "Date Visit (yyyy-mm-dd)", "Drug type", "Regimens (Include supported Drugs)",
-            "Refill Period", "MMD_Type"
-        ]
+        header_fill = PatternFill(start_color="1a365d", end_color="1a365d", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF", size=10)
+        match_fill = PatternFill(start_color="f0fdf4", end_color="f0fdf4", fill_type="solid")
+        corrected_fill = PatternFill(start_color="fffbeb", end_color="fffbeb", fill_type="solid")
+        mismatch_fill = PatternFill(start_color="fef2f2", end_color="fef2f2", fill_type="solid")
+        not_reviewed_fill = PatternFill(start_color="f8fafc", end_color="f8fafc", fill_type="solid")
+        
         thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
+            left=Side(style='thin', color='d1d5db'),
+            right=Side(style='thin', color='d1d5db'),
+            top=Side(style='thin', color='d1d5db'),
+            bottom=Side(style='thin', color='d1d5db')
         )
+        
+        center_alignment = Alignment(horizontal="center", vertical="center")
+        
+        # ================================================================
+        # HEADERS - Row 1
+        # ================================================================
+        headers = [
+            "S/No.",
+            "Facility",
+            "DATIM ID",
+            "Patient UUID",
+            "Hospital Number",
+            "Sex Status",
+            "Date of Birth Status",
+            "ART Start Status",
+            "Pickup Status",
+            "Month of ARV\n(Duration) Status",
+            "Sample Collection\nDate Status",
+            "VL Result\nStatus",
+            "Date of Viral\nLoad Status",
+            "Verified Date",
+            "Verified by"
+        ]
         
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=1, column=col, value=header)
             cell.font = header_font
             cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.alignment = header_alignment
             cell.border = thin_border
+        ws.row_dimensions[1].height = 36
         
-        for row_idx, row_data in enumerate(pharmacy_data, 2):
-            ws.cell(row=row_idx, column=1, value=row_data['s_no']).border = thin_border
-            ws.cell(row=row_idx, column=2, value=row_data['facility_name']).border = thin_border
-            ws.cell(row=row_idx, column=3, value=row_data['datim_id']).border = thin_border
-            ws.cell(row=row_idx, column=4, value=row_data['patient_id']).border = thin_border
-            ws.cell(row=row_idx, column=5, value=row_data['hospital_num']).border = thin_border
-            ws.cell(row=row_idx, column=6, value=row_data['date_visit']).border = thin_border
-            ws.cell(row=row_idx, column=7, value=row_data['regimen_line']).border = thin_border
-            ws.cell(row=row_idx, column=8, value=row_data['regimens']).border = thin_border
-            ws.cell(row=row_idx, column=9, value=row_data['refill_period']).border = thin_border
-            ws.cell(row=row_idx, column=10, value=row_data['mmd_type']).border = thin_border
-           
+        # ================================================================
+        # DATA ROWS - Starting from Row 2
+        # ================================================================
+        for row_idx, row_data in enumerate(report_data):
+            excel_row = 2 + row_idx
+            
+            values = [
+                row_data['s_no'],
+                row_data['facility_name'],
+                row_data['datim_id'],
+                row_data['patient_uuid'],
+                row_data['hospital_number'],
+                row_data['sex_status'],
+                row_data['dob_status'],
+                row_data['art_start_status'],
+                row_data['pickup_status'],
+                row_data['duration_status'],
+                row_data['vl_sample_date'],
+                row_data['vl_result_status'],
+                row_data['vl_result_date_status'],
+                row_data['verified_at'],
+                row_data['verified_by']
+            ]
+            
+            for col, value in enumerate(values, 1):
+                cell = ws.cell(row=excel_row, column=col, value=value)
+                cell.border = thin_border
+                cell.font = Font(size=9, name="Calibri")
+                
+                if col >= 6 and col <= 13:
+                    cell.alignment = center_alignment
+                    if "✅ Match" in str(value):
+                        cell.fill = match_fill
+                        cell.font = Font(size=9, color="059669", name="Calibri")
+                    elif "Corrected" in str(value):
+                        cell.fill = corrected_fill
+                        cell.font = Font(size=9, color="d97706", name="Calibri")
+                    elif "Mismatch" in str(value):
+                        cell.fill = mismatch_fill
+                        cell.font = Font(size=9, color="dc2626", name="Calibri")
+                    elif str(value) == "—":
+                        cell.fill = not_reviewed_fill
+                        cell.font = Font(size=9, color="94a3b8", name="Calibri", italic=True)
+                    elif col == 1:
+                        cell.alignment = center_alignment
+                    elif col == 14: 
+                        cell.alignment = center_alignment
+                        cell.font = Font(size=9, bold=True, name="Calibri", color="FF1e293b")
+                    else:
+                        cell.alignment = Alignment(vertical="center")
+            
+            ws.row_dimensions[excel_row].height = 22
         
-        widths = {1:6, 2:30, 3:15, 4:38, 5:18, 6:20, 7:15, 8:35, 9:12, 10:12, 11:20, 12:15}
+        # ================================================================
+        # COLUMN WIDTHS
+        # ================================================================
+        widths = {
+            1: 6,    # S/No
+            2: 28,   # Facility
+            3: 14,   # DATIM ID
+            4: 38,   # Patient UUID
+            5: 18,   # Hospital Number
+            6: 22,   # Sex Status
+            7: 22,   # DOB Status
+            8: 22,   # ART Start Status
+            9: 22,   # Pickup Status
+            10: 24,  # Duration Status
+            11: 24,  # VL Sample Date
+            12: 20,  # VL Result
+            13: 22,   # VL Result Date
+            14: 14,  # Verification Date
+            15: 22   # Verified By
+        }
         for col, width in widths.items():
             ws.column_dimensions[get_column_letter(col)].width = width
         
         ws.freeze_panes = 'A2'
+        ws.auto_filter.ref = f"A1:O{1 + len(report_data)}"
         
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
         
+        filename = f"DQA_Match_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
         return StreamingResponse(
             output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename=Pharmacy_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"}
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
         
     except Exception as e:
-        logger.error(f"Pharmacy Excel error: {e}")
+        logger.error(f"📊 Report generation error: {e}")
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-
 
 # ============================================================================
 # VIRAL LOAD EXCEL - SELF-CONTAINED
@@ -2859,180 +2916,6 @@ async def generate_viral_load_report_excel(
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-# ============================================================================
-# VIRAL LOAD EXCEL - NO TITLE ROWS, JUST HEADERS + DATA
-# ============================================================================
-
-@app.get("/api/reports/viral-load/excel")
-async def generate_viral_load_report_excel(
-    request: Request,
-    start_date: str = None,
-    end_date: str = None
-):
-    """Generate Viral Load Report Excel - clean format"""
-    try:
-        result = await generate_viral_load_report(request, start_date, end_date)
-        if not result.get("success"):
-            raise Exception(result.get("detail", "Failed"))
-        
-        vl_data = result.get("data", [])
-        
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-        
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Viral Load Report"
-        
-        headers = [
-            "S/No", "Facility Name", "DATIM Id", "Patient Id", "Hospital Num",
-            "Sample Collection Date", "Viral Load Result", "Result Date",
-            "VL Classification", "ART Start Date", "Current Regimen"
-        ]
-        
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF", size=10)
-        thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
-        
-        for col, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col, value=header)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = thin_border
-        
-        for row_idx, row_data in enumerate(vl_data, 2):
-            ws.cell(row=row_idx, column=1, value=row_data['s_no']).border = thin_border
-            ws.cell(row=row_idx, column=2, value=row_data['facility_name']).border = thin_border
-            ws.cell(row=row_idx, column=3, value=row_data['datim_id']).border = thin_border
-            ws.cell(row=row_idx, column=4, value=row_data['patient_id']).border = thin_border
-            ws.cell(row=row_idx, column=5, value=row_data['hospital_num']).border = thin_border
-            ws.cell(row=row_idx, column=6, value=row_data['sample_collection_date']).border = thin_border
-            ws.cell(row=row_idx, column=7, value=row_data['viral_load_result']).border = thin_border
-            ws.cell(row=row_idx, column=8, value=row_data['result_date']).border = thin_border
-            ws.cell(row=row_idx, column=9, value=row_data['vl_classification']).border = thin_border
-            ws.cell(row=row_idx, column=10, value=row_data['art_start_date']).border = thin_border
-            ws.cell(row=row_idx, column=11, value=row_data['current_regimen']).border = thin_border
-        
-        widths = {1:6, 2:30, 3:15, 4:38, 5:18, 6:20, 7:15, 8:20, 9:18, 10:20, 11:35}
-        for col, width in widths.items():
-            ws.column_dimensions[get_column_letter(col)].width = width
-        
-        ws.freeze_panes = 'A2'
-        
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-        
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename=VL_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"}
-        )
-        
-    except Exception as e:
-        logger.error(f"VL Excel error: {e}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-# ============================================================================
-# DQA SUMMARY REPORT - FROM DQA DATABASE
-# ============================================================================
-
-@app.get("/api/reports/dqa-summary")
-async def generate_dqa_summary_report(
-    request: Request,
-    start_date: str = None,
-    end_date: str = None
-):
-    """
-    Generate DQA Summary Report showing all verified records.
-    """
-    try:
-        from app.database import dqa_engine
-        from app.models.dqa_models import CareCardRecord, DQAAuditLog
-        from sqlalchemy.orm import Session
-        from sqlalchemy import func
-        
-        user = request.headers.get("X-User", "anonymous")
-        logger.info(f"User '{user}' generating DQA summary report")
-        
-        with Session(dqa_engine) as session:
-            # Build query
-            query = session.query(CareCardRecord)
-            audit_query = session.query(DQAAuditLog)
-            
-            if start_date:
-                query = query.filter(CareCardRecord.verified_at >= start_date)
-                audit_query = audit_query.filter(DQAAuditLog.created_at >= start_date)
-            if end_date:
-                query = query.filter(CareCardRecord.verified_at <= end_date)
-                audit_query = audit_query.filter(DQAAuditLog.created_at <= end_date)
-            
-            records = query.order_by(CareCardRecord.verified_at.desc()).all()
-            
-            summary_data = []
-            sno = 1
-            
-            for record in records:
-                drug_pickups = record.drug_pickups or []
-                viral_loads = record.viral_loads or []
-                
-                # Get drug names
-                drug_names = [p.get('regimen', '') or p.get('regimen_name', '') for p in drug_pickups]
-                drug_names = [d for d in drug_names if d]
-                
-                # Get VL results
-                vl_results = [v.get('viral_load_result', '') for v in viral_loads]
-                vl_results = [v for v in vl_results if v]
-                
-                summary_data.append({
-                    "s_no": sno,
-                    "hospital_number": record.hospital_number or 'N/A',
-                    "person_uuid": record.person_uuid or 'N/A',
-                    "drug_pickups_count": len(drug_pickups),
-                    "drugs": ', '.join(drug_names) if drug_names else 'N/A',
-                    "viral_loads_count": len(viral_loads),
-                    "vl_results": ', '.join(vl_results) if vl_results else 'N/A',
-                    "is_verified": "Yes" if record.is_verified else "No",
-                    "verified_by": record.verified_by or 'N/A',
-                    "verified_at": str(record.verified_at)[:19] if record.verified_at else 'N/A',
-                    "created_by": record.created_by or 'N/A',
-                    "updated_by": record.updated_by or 'N/A'
-                })
-                sno += 1
-            
-            # Get audit statistics
-            total_audits = audit_query.count()
-            matched_audits = audit_query.filter(DQAAuditLog.validation_status == 'Matched').count()
-            
-            return {
-                "success": True,
-                "count": len(summary_data),
-                "source": "DQA Care Card Database",
-                "statistics": {
-                    "total_verified": len([r for r in records if r.is_verified]),
-                    "total_audits": total_audits,
-                    "fully_matched": matched_audits,
-                    "match_rate": f"{(matched_audits/total_audits*100):.1f}%" if total_audits > 0 else "0%"
-                },
-                "filters": {
-                    "start_date": start_date,
-                    "end_date": end_date
-                },
-                "data": summary_data
-            }
-            
-    except Exception as e:
-        logger.error(f"DQA summary report error: {e}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-
 
 # ============================================================================
 # HELPER FUNCTIONS FOR REPORTS
@@ -3130,134 +3013,6 @@ def get_current_regimen_from_record(record):
 
 
 # ============================================================================
-# EXCEL EXPORT FOR PHARMACY REPORT (FROM DQA)
-# ============================================================================
-
-# ============================================================================
-# EXCEL EXPORT FOR VIRAL LOAD REPORT (FROM DQA)
-# ============================================================================
-
-@app.get("/api/reports/viral-load/excel")
-async def generate_viral_load_report_excel(
-    request: Request,
-    start_date: str = None,
-    end_date: str = None
-):
-    """Generate Viral Load Report as Excel from DQA database"""
-    try:
-        from app.database import dqa_engine
-        from app.models.dqa_models import CareCardRecord
-        from sqlalchemy.orm import Session
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-        
-        user = request.headers.get("X-User", "anonymous")
-        logger.info(f"User '{user}' generating VL Excel from DQA database")
-        
-        with Session(dqa_engine) as session:
-            query = session.query(CareCardRecord)
-            if start_date:
-                query = query.filter(CareCardRecord.verified_at >= start_date)
-            if end_date:
-                query = query.filter(CareCardRecord.verified_at <= end_date)
-            
-            records = query.order_by(CareCardRecord.updated_at.desc()).all()
-        
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Viral Load Report"
-        
-        # Title
-        ws.merge_cells('A1:L1')
-        ws['A1'] = "MedDQA - Viral Load Report (Care Card Data)"
-        ws['A1'].font = Font(bold=True, size=16, color="1e40af")
-        ws['A1'].alignment = Alignment(horizontal="center")
-        
-        ws.merge_cells('A2:L2')
-        ws['A2'] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Source: DQA Care Card Database"
-        ws['A2'].alignment = Alignment(horizontal="center")
-        
-        # Headers
-        headers = [
-            "S/No", "Facility Name", "DATIM Id", "Patient Id", "Hospital Num",
-            "Sample Collection Date", "Viral Load Result", "Result Date",
-            "VL Classification", "ART Start Date", "Current Regimen", "Verified By"
-        ]
-        
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(bold=True, color="FFFFFF", size=10)
-        thin_border = Border(
-            left=Side(style='thin'), right=Side(style='thin'),
-            top=Side(style='thin'), bottom=Side(style='thin')
-        )
-        
-        for col, header in enumerate(headers, 1):
-            cell = ws.cell(row=4, column=col, value=header)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = thin_border
-        
-        # Data
-        row_idx = 5
-        sno = 1
-        
-        for record in records:
-            viral_loads = record.viral_loads or []
-            current_regimen = get_current_regimen_from_record(record)
-            
-            for vl in viral_loads:
-                vl_result = vl.get('viral_load_result', '') or 'N/A'
-                classification = classify_vl_result(vl_result)
-                
-                ws.cell(row=row_idx, column=1, value=sno).border = thin_border
-                ws.cell(row=row_idx, column=2, value=getattr(record, 'facility_name', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=3, value=getattr(record, 'datim_id', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=4, value=record.person_uuid or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=5, value=record.hospital_number or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=6, value=vl.get('sample_collection_date', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=7, value=vl_result).border = thin_border
-                ws.cell(row=row_idx, column=8, value=vl.get('result_date', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=9, value=classification).border = thin_border
-                ws.cell(row=row_idx, column=10, value=getattr(record, 'art_start_date', 'N/A') or 'N/A').border = thin_border
-                ws.cell(row=row_idx, column=11, value=current_regimen).border = thin_border
-                ws.cell(row=row_idx, column=12, value=record.verified_by or record.updated_by or 'N/A').border = thin_border
-                
-                row_idx += 1
-                sno += 1
-        
-        # Column widths
-        col_widths = {1: 6, 2: 30, 3: 15, 4: 38, 5: 18, 6: 20, 7: 15, 8: 20, 9: 18, 10: 20, 11: 35, 12: 20}
-        for col, width in col_widths.items():
-            ws.column_dimensions[get_column_letter(col)].width = width
-        
-        ws.freeze_panes = 'A5'
-        
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-        
-        filename = f"VL_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-        
-    except Exception as e:
-        logger.error(f"VL Excel error: {e}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-    
-
-# ============================================================================
-# LAB SETTINGS API
-# ============================================================================
-
-# ============================================================================
 # LAB SETTINGS API
 # ============================================================================
 
@@ -3336,72 +3091,6 @@ async def update_lab_settings(request: Request):
     except Exception as e:
         logger.error(f"Update lab settings error: {e}")
         return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
-
-# ============================================================================
-# VL RESULT FORMATTING & PDF GENERATION - COMPLETE FULL CODE
-# ============================================================================
-
-def clean_regimen_name(name):
-    """
-    Clean regimen name for display.
-    Converts "TDF(300mg)/3TC(300mg)/DTG(50mg)" → "TDF-3TC-DTG"
-    Removes dosage in parentheses and replaces / with -
-    """
-    if not name or name == "Unknown":
-        return "N/A"
-    
-    import re
-    # Remove anything in parentheses like (300mg), (50mg), (INH)
-    cleaned = re.sub(r'\([^)]*\)', '', name)
-    # Replace / with -
-    cleaned = cleaned.replace('/', '-')
-    # Clean up multiple dashes
-    cleaned = re.sub(r'-+', '-', cleaned)
-    # Remove leading/trailing dashes and spaces
-    cleaned = cleaned.strip('-').strip()
-    
-    return cleaned if cleaned else "N/A"
-
-
-def format_vl_for_print(vl_value):
-    """
-    Format VL result for printing.
-    - 0 or TND → "TND"
-    - 1-20 → "<20"
-    - 21+ → actual number
-    """
-    if not vl_value or vl_value == 'N/A':
-        return 'N/A'
-    
-    vl_str = str(vl_value).strip().upper()
-    
-    # TND / Not Detected / Zero
-    if vl_str in ['TND', 'NOT DETECTED', 'UNDETECTABLE', '0', '0.0']:
-        return 'TND'
-    
-    # Already has < sign - only keep if it's <20 or less
-    if vl_str.startswith('<'):
-        try:
-            num = int(float(vl_str[1:].strip().replace(',', '')))
-            if num == 0:
-                return 'TND'
-            if num <= 20:
-                return '<20'
-            # If >20, just return the number without <
-            return str(num)
-        except (ValueError, TypeError):
-            return 'N/A'
-    
-    # Numeric values
-    try:
-        num = int(float(vl_str.replace(',', '')))
-        if num == 0:
-            return 'TND'
-        if num <= 20:
-            return '<20'
-        return str(num)
-    except (ValueError, TypeError):
-        return 'N/A'
 
 
 # ============================================================================
@@ -3767,7 +3456,7 @@ def create_vl_pdf(data):
     c.drawString(100, y, f"{clinician_date}")
     c.drawString(280, y, f"{assayed_date}")
     c.drawString(490, y, f"{approved_date}")
-    y -=-20
+    y += 20
     # Column headers at the bottom
     c.setFont("Helvetica", 9)
     c.drawString(55, y - 38, "Clinician-Date")
@@ -3815,7 +3504,7 @@ async def print_vl_result(hospital_number: str, sample_date: str, request: Reque
                         INITCAP(p.sex) AS sex,
                         EXTRACT(YEAR FROM AGE(CURRENT_DATE, p.date_of_birth)) AS age,
                         p.date_of_birth, p.hospital_number,
-                        h.date_of_registration AS art_start_date,
+                        hac.visit_date::DATE AS art_start_date,
                         facility.name AS facility_name,
                         facility_state.name AS state,
                         h.unique_id
@@ -3824,7 +3513,9 @@ async def print_vl_result(hospital_number: str, sample_date: str, request: Reque
                     INNER JOIN base_organisation_unit facility ON facility.id = h.facility_id
                     INNER JOIN base_organisation_unit facility_lga ON facility_lga.id = facility.parent_organisation_unit_id
                     INNER JOIN base_organisation_unit facility_state ON facility_state.id = facility_lga.parent_organisation_unit_id
-                    WHERE p.hospital_number = :hn AND p.archived = 0 LIMIT 1
+                    LEFT JOIN hiv_art_clinical hac ON hac.hiv_enrollment_uuid = h.uuid 
+                        AND hac.archived = 0 AND hac.is_commencement = TRUE
+                     WHERE p.hospital_number = :hn AND p.archived = 0 LIMIT 1
                 """),
                 {"hn": hospital_number}
             ).fetchone()
@@ -3939,9 +3630,239 @@ async def print_vl_result(hospital_number: str, sample_date: str, request: Reque
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+    
+
+
 # ============================================================================
-# STARTUP EVENT
+# USER AUTHENTICATION - SESSION STORE (defined early; used by middleware)
 # ============================================================================
+
+user_sessions: dict = {}  # token -> {user_id, username, full_name, role, expires}
+
+
+def hash_password(password: str) -> str:
+    """Simple password hashing"""
+    salt = "meddqa_salt_2024"
+    return hashlib.sha256(f"{password}{salt}".encode()).hexdigest()
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify password against hash"""
+    return hash_password(password) == password_hash
+
+
+def get_current_user_from_token(token: str):
+    """Get current user from session token; returns None if missing/expired."""
+    if token and token in user_sessions:
+        session = user_sessions[token]
+        if session["expires"] > datetime.now():
+            return session
+    return None
+
+
+def log_activity(session, user_id, username, action, details, hospital_number, ip_address):
+    """Log user activity"""
+    try:
+        from app.models.dqa_models import ActivityLog
+        log = ActivityLog(
+            user_id=user_id,
+            username=username,
+            action=action,
+            details=details or {},
+            hospital_number=hospital_number,
+            ip_address=ip_address
+        )
+        session.add(log)
+    except Exception as e:
+        logger.warning(f"Activity log error: {e}")
+
+
+@app.middleware("http")
+async def combined_middleware(request: Request, call_next):
+    """Combined middleware: setup check + authentication"""
+    
+    # ========================================================================
+    # 1. PATHS THAT DON'T REQUIRE SETUP CHECK
+    # ========================================================================
+    setup_free_paths = [
+        '/setup', '/api/setup', '/static', '/health',
+        '/api/debug', '/api/schema', '/favicon.ico',
+        '/login', '/api/auth'  # ✅ All auth paths
+    ]
+    
+    needs_setup_check = not any(request.url.path.startswith(p) for p in setup_free_paths)
+    
+    if needs_setup_check and not is_setup_complete():
+        return RedirectResponse(url='/setup', status_code=302)
+    
+    # ========================================================================
+    # 2. PATHS THAT DON'T REQUIRE AUTHENTICATION
+    # ========================================================================
+    public_paths = [
+        '/login', 
+        '/api/auth',      # ✅ This covers /api/auth/login, /api/auth/logout, /api/auth/me
+        '/setup', 
+        '/api/setup', 
+        '/static', 
+        '/health',
+        '/api/debug', 
+        '/favicon.ico'
+    ]
+    
+    is_public = any(request.url.path.startswith(p) for p in public_paths)
+    
+    if is_public:
+        # Track user for backward compatibility
+        user = request.headers.get("X-User", "anonymous")
+        if user and user != "anonymous":
+            active_sessions[user] = datetime.now()
+        return await call_next(request)
+    
+    # ========================================================================
+    # 3. AUTHENTICATION CHECK FOR PROTECTED PATHS
+    # ========================================================================
+    token = request.headers.get("X-Session-Token") or request.cookies.get("meddqa_token")
+    
+    if token and token in user_sessions:
+        session = user_sessions[token]
+        if session["expires"] > datetime.now():
+            # Extend session
+            session["expires"] = datetime.now() + timedelta(hours=12)
+            return await call_next(request)
+    
+    # ========================================================================
+    # 4. NOT AUTHENTICATED
+    # ========================================================================
+    if not request.url.path.startswith('/api/'):
+        return RedirectResponse(url='/login', status_code=302)
+    
+    return JSONResponse(
+        status_code=401,
+        content={"success": False, "detail": "Authentication required"}
+    )
+    # ============================================================================
+# USER AUTHENTICATION API
+# ============================================================================
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    """Login page"""
+    return templates.TemplateResponse("login.html", {"request": request})
+
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    """User login"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import User
+        from sqlalchemy.orm import Session
+        
+        data = await request.json()
+        username = data.get('username', '').strip()
+        password = data.get('password', '')
+        ip_address = request.client.host if request.client else 'unknown'
+        
+        logger.info(f"Login attempt: {username} from {ip_address}")
+        
+        if not username or not password:
+            return JSONResponse(status_code=400, content={
+                "success": False, "detail": "Username and password required"
+            })
+        
+        with Session(dqa_engine) as session:
+            user = session.query(User).filter(
+                User.username == username,
+                User.is_active == True
+            ).first()
+            
+            if not user:
+                logger.warning(f"Login failed: user '{username}' not found")
+                return JSONResponse(status_code=401, content={
+                    "success": False, "detail": "Invalid username or password"
+                })
+            
+            if not verify_password(password, user.password_hash):
+                logger.warning(f"Login failed: invalid password for '{username}'")
+                log_activity(session, user.id, username, "login_failed", 
+                            {"reason": "invalid_password"}, None, ip_address)
+                return JSONResponse(status_code=401, content={
+                    "success": False, "detail": "Invalid username or password"
+                })
+            
+            # Generate session token
+            session_token = secrets.token_urlsafe(32)
+            user_sessions[session_token] = {
+                "user_id": user.id,
+                "username": user.username,
+                "full_name": user.full_name,
+                "role": user.role,
+                "expires": datetime.now() + timedelta(hours=12)
+            }
+            
+            # Update last login
+            user.last_login = datetime.now()
+            
+            # Log activity
+            log_activity(session, user.id, username, "login", 
+                        {"ip": ip_address}, None, ip_address)
+            
+            session.commit()
+            
+            logger.info(f"✅ Login successful: {username} ({user.role})")
+            
+            return {
+                "success": True,
+                "token": session_token,
+                "user": {
+                    "id": user.id,
+                    "full_name": user.full_name,
+                    "username": user.username,
+                    "role": user.role,
+                    "position": user.position or ''
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    """User logout"""
+    token = request.headers.get("X-Session-Token", "")
+    if token in user_sessions:
+        user = user_sessions[token]
+        logger.info(f"Logout: {user['username']}")
+        del user_sessions[token]
+    return {"success": True, "message": "Logged out successfully"}
+
+
+@app.get("/api/auth/me")
+async def get_current_user(request: Request):
+    """Get current logged-in user"""
+    token = request.headers.get("X-Session-Token", "")
+    
+    session = get_current_user_from_token(token)
+    
+    if not session:
+        return JSONResponse(status_code=401, content={
+            "success": False, "detail": "Not authenticated"
+        })
+    
+    return {
+        "success": True,
+        "user": {
+            "id": session["user_id"],
+            "full_name": session["full_name"],
+            "username": session["username"],
+            "role": session["role"]
+        }
+    }
 
 @app.on_event("startup")
 async def startup_event():
@@ -3957,10 +3878,218 @@ async def startup_event():
                 logger.info("✅ EMR Database connected")
             if dqa_engine:
                 logger.info("✅ DQA Database connected")
+                
+                # ✅ Create default admin if no users exist
+                try:
+                    from app.models.dqa_models import User
+                    from sqlalchemy.orm import Session
+                    
+                    with Session(dqa_engine) as session:
+                        user_count = session.query(User).count()
+                        if user_count == 0:
+                            admin = User(
+                                full_name="System Administrator",
+                                username="admin",
+                                password_hash=hash_password("password"),
+                                role="admin",
+                                position="Administrator"
+                            )
+                            session.add(admin)
+                            session.commit()
+                            logger.info("✅ Default admin created: admin/password")
+                except Exception as e:
+                    logger.warning(f"Default admin check: {e}")
         except Exception as e:
             logger.warning(f"Database initialization: {e}")
     
     logger.info("=" * 60)
+# ============================================================================
+# USER MANAGEMENT API (Admin Only)
+# ============================================================================
+
+@app.get("/api/users")
+async def list_users(request: Request):
+    """List all users (Admin only)"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import User
+        from sqlalchemy.orm import Session
+        
+        token = request.headers.get("X-Session-Token", "")
+        session_data = get_current_user_from_token(token)
+        
+        if not session_data or session_data.get("role") != "admin":
+            return JSONResponse(status_code=403, content={
+                "success": False, "detail": "Admin access required"
+            })
+        
+        with Session(dqa_engine) as session:
+            users = session.query(User).order_by(User.created_at.desc()).all()
+            
+            return {
+                "success": True,
+                "users": [
+                    {
+                        "id": u.id,
+                        "full_name": u.full_name,
+                        "username": u.username,
+                        "role": u.role,
+                        "position": u.position or '',
+                        "is_active": u.is_active,
+                        "last_login": str(u.last_login)[:19] if u.last_login else None,
+                        "created_at": str(u.created_at)[:19] if u.created_at else None
+                    }
+                    for u in users
+                ]
+            }
+    except Exception as e:
+        logger.error(f"List users error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+
+@app.post("/api/users")
+async def create_user(request: Request):
+    """Create new user (Admin only)"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import User
+        from sqlalchemy.orm import Session
+        
+        token = request.headers.get("X-Session-Token", "")
+        session_data = get_current_user_from_token(token)
+        
+        if not session_data or session_data.get("role") != "admin":
+            return JSONResponse(status_code=403, content={
+                "success": False, "detail": "Admin access required"
+            })
+        
+        data = await request.json()
+        
+        if not data.get('username') or not data.get('password'):
+            return JSONResponse(status_code=400, content={
+                "success": False, "detail": "Username and password required"
+            })
+        
+        with Session(dqa_engine) as session:
+            existing = session.query(User).filter(User.username == data['username']).first()
+            if existing:
+                return JSONResponse(status_code=400, content={
+                    "success": False, "detail": "Username already exists"
+                })
+            
+            new_user = User(
+                full_name=data.get('full_name', data['username']),
+                username=data['username'],
+                password_hash=hash_password(data['password']),
+                role=data.get('role', 'dqa_team'),
+                position=data.get('position', ''),
+                created_by=session_data['username']
+            )
+            session.add(new_user)
+            session.commit()
+            
+            logger.info(f"✅ User created: {data['username']} by {session_data['username']}")
+            
+            return {
+                "success": True,
+                "message": f"User '{data['username']}' created successfully"
+            }
+            
+    except Exception as e:
+        logger.error(f"Create user error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+@app.put("/api/users/{user_id}")
+async def update_user(user_id: int, request: Request):
+    """Update user details including password (Admin only)"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import User
+        from sqlalchemy.orm import Session
+        
+        token = request.headers.get("X-Session-Token", "")
+        session_data = get_current_user_from_token(token)
+        
+        if not session_data or session_data.get("role") != "admin":
+            return JSONResponse(status_code=403, content={
+                "success": False, "detail": "Admin access required"
+            })
+        
+        data = await request.json()
+        
+        with Session(dqa_engine) as session:
+            user = session.query(User).filter(User.id == user_id).first()
+            if not user:
+                return JSONResponse(status_code=404, content={
+                    "success": False, "detail": "User not found"
+                })
+            
+            # Update fields if provided
+            if 'full_name' in data and data['full_name']:
+                user.full_name = data['full_name']
+            if 'role' in data and data['role']:
+                user.role = data['role']
+            if 'position' in data:
+                user.position = data['position']
+            if 'is_active' in data:
+                user.is_active = data['is_active']
+            if 'password' in data and data['password']:
+                user.password_hash = hash_password(data['password'])
+            
+            session.commit()
+            
+            logger.info(f"✅ User updated: {user.username} by {session_data['username']}")
+            
+            return {"success": True, "message": f"User '{user.username}' updated successfully"}
+            
+    except Exception as e:
+        logger.error(f"Update user error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: int, request: Request):
+    """Delete a user (Admin only)"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import User
+        from sqlalchemy.orm import Session
+        
+        token = request.headers.get("X-Session-Token", "")
+        session_data = get_current_user_from_token(token)
+        
+        if not session_data or session_data.get("role") != "admin":
+            return JSONResponse(status_code=403, content={
+                "success": False, "detail": "Admin access required"
+            })
+        
+        with Session(dqa_engine) as session:
+            user = session.query(User).filter(User.id == user_id).first()
+            if not user:
+                return JSONResponse(status_code=404, content={
+                    "success": False, "detail": "User not found"
+                })
+            
+            # Don't allow deleting yourself
+            if user.username == session_data['username']:
+                return JSONResponse(status_code=400, content={
+                    "success": False, "detail": "You cannot delete your own account"
+                })
+            
+            username = user.username
+            session.delete(user)
+            session.commit()
+            
+            logger.info(f"🗑️ User deleted: {username} by {session_data['username']}")
+            
+            return {"success": True, "message": f"User '{username}' deleted successfully"}
+            
+    except Exception as e:
+        logger.error(f"Delete user error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})    
+# ============================================================================
+# STARTUP EVENT
+# ============================================================================
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -3969,6 +4098,1136 @@ async def shutdown_event():
     record_locks.clear()
     active_sessions.clear()
 
+@app.post("/api/review/complete")
+async def complete_review_workflow(request: Request):
+    """
+    Complete the review workflow and save results to proper columns.
+    Extracts username from session token for reliable attribution.
+    """
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import CareCardRecord, DQAAuditLog, User
+        from sqlalchemy.orm import Session
+        import json, hashlib
+        from datetime import datetime
+        
+        body = await request.json()
+        
+        hospital_number = body.get("hospital_number")
+        person_uuid = body.get("person_uuid")
+        review_results = body.get("review_results", [])
+        total_fields = body.get("total_fields", 0)
+        matched_fields = body.get("matched_fields", 0)
+        corrected_on_emr = body.get("corrected_on_emr", 0)
+        corrected_on_carecard = body.get("corrected_on_carecard", 0)
+        
+        # ================================================================
+        # GET USERNAME
+        # ================================================================
+        verified_by = body.get("verified_by", None)
+        if not verified_by or verified_by == "Unknown":
+            verified_by = request.headers.get("X-User", None)
+        if not verified_by or verified_by == "Unknown":
+            verified_by = request.headers.get("x-user", "Unknown")
+        
+        logger.info(f"📝 Saving review for {hospital_number} by: {verified_by}")
+        
+        affected_visits_map = body.get("affected_visits", {})  # {field: [indices]}
+
+        # ================================================================
+        # SEPARATE RESULTS BY TYPE
+        # ================================================================
+        biodata_results = [r for r in review_results if r.get("step") == 1]
+        latest_refill_results = [r for r in review_results if r.get("step") == 2]
+        refill_batch_results = [r for r in review_results if r.get("step") == 3]
+        vl_batch_results = [r for r in review_results if r.get("step") == 4]
+        
+        # ================================================================
+        # BUILD CLEAN BIODATA WITH ALL FIELDS PRESERVED
+        # ================================================================
+        biodata_clean = []
+        for r in biodata_results:
+            biodata_clean.append({
+                "field": r.get("field"),
+                "label": r.get("label"),
+                "emr_value": r.get("emr_value"),
+                "match": r.get("match", False),
+                "corrected_on": r.get("corrected_on"),
+                "discrepancy_type": r.get("discrepancy_type"),
+                "discrepancy_note": r.get("discrepancy_note"),
+                "care_card_value": r.get("care_card_value"),
+                "original_emr_value": r.get("original_emr_value"),
+                "affected_visits": r.get("affected_visits") or affected_visits_map.get(r.get("field"), []),
+                "step": 1
+            })
+        
+        # ================================================================
+        # BUILD CLEAN LATEST REFILL WITH ALL FIELDS PRESERVED
+        # ================================================================
+        latest_refill_clean = []
+        for r in latest_refill_results:
+            latest_refill_clean.append({
+                "field": r.get("field"),
+                "label": r.get("label"),
+                "emr_value": r.get("emr_value"),
+                "match": r.get("match", False),
+                "corrected_on": r.get("corrected_on"),
+                "discrepancy_type": r.get("discrepancy_type"),
+                "discrepancy_note": r.get("discrepancy_note"),
+                "care_card_value": r.get("care_card_value"),
+                "original_emr_value": r.get("original_emr_value"),
+                "affected_visits": r.get("affected_visits") or affected_visits_map.get(r.get("field"), []),
+                "step": 2
+            })
+        
+        # ================================================================
+        # BUILD ENROLLMENT DATA
+        # ================================================================
+        enrollment_data = {
+            "biodata_verification": biodata_clean,
+            "biodata_matched": sum(1 for r in biodata_clean if r.get("match")),
+            "biodata_total": len(biodata_clean),
+            "latest_refill_verification": latest_refill_clean,
+            "latest_refill_matched": sum(1 for r in latest_refill_clean if r.get("match")),
+            "latest_refill_total": len(latest_refill_clean),
+            "review_completed": True,
+            "verified_by": verified_by,
+            "verified_at": datetime.utcnow().isoformat()
+        }
+        
+        # ================================================================
+        # BUILD DRUG PICKUPS WITH ALL FIELDS INCLUDING DISCREPANCY INFO
+        # ================================================================
+        drug_pickups = []
+        for r in refill_batch_results:
+            drug_pickups.append({
+                "field": r.get("field"),
+                "label": r.get("label"),
+                "emr_summary": r.get("emr_value"),
+                "match": r.get("match", False),
+                "corrected_on": r.get("corrected_on"),
+                "discrepancy_type": r.get("discrepancy_type"),
+                "discrepancy_note": r.get("discrepancy_note"),
+                "care_card_value": r.get("care_card_value"),
+                "original_emr_value": r.get("original_emr_value"),
+                "affected_visits": r.get("affected_visits") or affected_visits_map.get(r.get("field"), []),
+                "reviewed_by": verified_by,
+                "reviewed_at": datetime.utcnow().isoformat()
+            })
+        
+        # ================================================================
+        # BUILD VIRAL LOADS WITH ALL FIELDS INCLUDING DISCREPANCY INFO
+        # ================================================================
+        viral_loads = []
+        for r in vl_batch_results:
+            viral_loads.append({
+                "field": r.get("field"),
+                "label": r.get("label"),
+                "emr_summary": r.get("emr_value"),
+                "match": r.get("match", False),
+                "corrected_on": r.get("corrected_on"),
+                "discrepancy_type": r.get("discrepancy_type"),
+                "discrepancy_note": r.get("discrepancy_note"),
+                "care_card_value": r.get("care_card_value"),
+                "original_emr_value": r.get("original_emr_value"),
+                "affected_visits": r.get("affected_visits") or affected_visits_map.get(r.get("field"), []),
+                "reviewed_by": verified_by,
+                "reviewed_at": datetime.utcnow().isoformat()
+            })
+        
+        # ================================================================
+        # CALCULATE STATISTICS
+        # ================================================================
+        match_rate = f"{round((matched_fields / total_fields * 100), 1)}%" if total_fields > 0 else "0%"
+        mismatched_fields = total_fields - matched_fields
+        now = datetime.utcnow()
+        
+        # ================================================================
+        # SAVE TO DATABASE
+        # ================================================================
+        with Session(dqa_engine) as session:
+            existing = session.query(CareCardRecord).filter(
+                CareCardRecord.hospital_number == hospital_number
+            ).first()
+            
+            if existing:
+                existing.enrollment_data = enrollment_data
+                if drug_pickups:
+                    existing.drug_pickups = drug_pickups
+                if viral_loads:
+                    existing.viral_loads = viral_loads
+                existing.is_verified = True
+                existing.verified_by = verified_by
+                existing.verified_at = now
+                existing.updated_by = verified_by
+                existing.created_by = existing.created_by or verified_by
+                existing.updated_at = now
+                logger.info(f"📝 Updated care card record for {hospital_number}")
+            else:
+                new_record = CareCardRecord(
+                    hospital_number=hospital_number,
+                    person_uuid=person_uuid,
+                    enrollment_data=enrollment_data,
+                    drug_pickups=drug_pickups if drug_pickups else [],
+                    viral_loads=viral_loads if viral_loads else [],
+                    is_verified=True,
+                    verified_by=verified_by,
+                    verified_at=now,
+                    created_by=verified_by,
+                    updated_by=verified_by
+                )
+                session.add(new_record)
+                logger.info(f"📝 Created new care card record for {hospital_number}")
+            
+            # ================================================================
+            # SAVE AUDIT LOG
+            # ================================================================
+            audit_log = DQAAuditLog(
+                hospital_number=hospital_number,
+                person_uuid=person_uuid,
+                care_card_data={
+                    "biodata_results": biodata_clean,
+                    "refill_results": refill_batch_results,
+                    "vl_results": vl_batch_results,
+                    "total_fields": total_fields,
+                    "matched_fields": matched_fields,
+                    "mismatched_fields": mismatched_fields,
+                    "corrected_on_emr": corrected_on_emr,
+                    "corrected_on_carecard": corrected_on_carecard,
+                    "match_rate": match_rate
+                },
+                validation_status="Matched" if mismatched_fields == 0 else "Corrected",
+                discrepancies_found=(mismatched_fields > 0),
+                issues_fixed=corrected_on_emr + corrected_on_carecard,
+                total_comparisons=total_fields,
+                matched_comparisons=matched_fields,
+                user_name=verified_by
+            )
+            session.add(audit_log)
+            session.commit()
+            
+            logger.info(f"✅ Review saved - Audit ID: {audit_log.id}, By: {verified_by}")
+            
+            # ✅ LOG WHAT WAS SAVED FOR DEBUGGING
+            logger.info(f"   Biodata items: {len(biodata_clean)}")
+            logger.info(f"   Latest refill items: {len(latest_refill_clean)}")
+            logger.info(f"   Drug pickups: {len(drug_pickups)}")
+            logger.info(f"   Viral loads: {len(viral_loads)}")
+            
+            # Log discrepancy details
+            for item in biodata_clean + latest_refill_clean:
+                if not item.get("match") and item.get("discrepancy_type"):
+                    logger.info(f"   Discrepancy: {item['field']} -> {item['discrepancy_type']} | Note: {item.get('discrepancy_note', 'N/A')}")
+            
+            for item in drug_pickups + viral_loads:
+                if not item.get("match") and item.get("discrepancy_type"):
+                    logger.info(f"   Batch Discrepancy: {item['field']} -> {item['discrepancy_type']} | Note: {item.get('discrepancy_note', 'N/A')}")
+        
+        # ================================================================
+        # RETURN RESPONSE
+        # ================================================================
+        return {
+            "success": True,
+            "audit_id": audit_log.id,
+            "summary": {
+                "total": total_fields,
+                "matched": matched_fields,
+                "mismatched": mismatched_fields,
+                "match_rate": match_rate,
+                "corrected_emr": corrected_on_emr,
+                "corrected_carecard": corrected_on_carecard,
+                "verified_by": verified_by,
+                "breakdown": {
+                    "biodata": f"{sum(1 for r in biodata_clean if r.get('match'))}/{len(biodata_clean)}",
+                    "latest_refill": f"{sum(1 for r in latest_refill_clean if r.get('match'))}/{len(latest_refill_clean)}",
+                    "refill_history": f"{sum(1 for r in refill_batch_results if r.get('match'))}/{len(refill_batch_results)}",
+                    "vl_history": f"{sum(1 for r in vl_batch_results if r.get('match'))}/{len(vl_batch_results)}"
+                }
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Review completion error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+    
+
+@app.get("/api/review/start/{hospital_number:path}")
+async def start_review_workflow(hospital_number: str, request: Request):
+    """
+    Start the step-by-step care card review workflow.
+    Returns patient EMR data AND any previously saved review.
+    Loads from the correct columns: enrollment_data, drug_pickups, viral_loads
+    """
+    try:
+        from app.database import emr_engine, dqa_engine
+        from app.models.dqa_models import CareCardRecord
+        from sqlalchemy.orm import Session
+        
+        hospital_number = unquote(hospital_number)
+        logger.info(f"📋 Starting review workflow for: {hospital_number}")
+        
+        # ================================================================
+        # LOAD PREVIOUS REVIEW FROM CORRECT COLUMNS
+        # ================================================================
+# In previous_review:
+        previous_review = {
+            "biodata": [],
+            "latest_refill": [],
+            "refill_batch": {},
+            "vl_batch": {},
+            "care_card_values": {},
+            "original_emr_values": {},
+            "discrepancy_types": {},     
+            "discrepancy_notes": {},     
+            "is_complete": False
+        }
+        
+        drug_pickups_details = []
+        viral_loads_details = []
+        care_record = None  # ✅ Initialize before try block
+        
+        try:
+            with Session(dqa_engine) as session:
+                care_record = session.query(CareCardRecord).filter(
+                    CareCardRecord.hospital_number == hospital_number
+                ).first()
+                
+                if care_record:
+                    logger.info(f"📂 Found care card record for {hospital_number}")
+                    
+                    # Load biodata + latest refill from enrollment_data
+                    if care_record.enrollment_data and isinstance(care_record.enrollment_data, dict):
+                        ed = care_record.enrollment_data
+                        previous_review["biodata"] = ed.get("biodata_verification", [])
+                        previous_review["latest_refill"] = ed.get("latest_refill_verification", [])
+                        previous_review["is_complete"] = ed.get("review_completed", False)
+                        
+                        # Load direct maps from enrollment_data
+                        previous_review["discrepancy_types"] = ed.get("discrepancy_types", {})
+                        previous_review["discrepancy_notes"] = ed.get("discrepancy_notes", {})
+                        
+                        # Extract care_card_values and original_emr_values from biodata
+                        for item in previous_review["biodata"]:
+                            if isinstance(item, dict):
+                                fld = item.get("field")
+                                if fld:
+                                    if item.get("care_card_value"):
+                                        previous_review["care_card_values"][fld] = item["care_card_value"]
+                                    if item.get("original_emr_value"):
+                                        previous_review["original_emr_values"][fld] = item["original_emr_value"]
+                                    if item.get("discrepancy_type"):
+                                        previous_review["discrepancy_types"][fld] = item["discrepancy_type"]
+                                    if item.get("discrepancy_note"):
+                                        previous_review["discrepancy_notes"][fld] = item["discrepancy_note"]
+                        
+                        # Extract from latest_refill
+                        for item in previous_review["latest_refill"]:
+                            if isinstance(item, dict):
+                                fld = item.get("field")
+                                if fld:
+                                    if item.get("care_card_value"):
+                                        previous_review["care_card_values"][fld] = item["care_card_value"]
+                                    if item.get("original_emr_value"):
+                                        previous_review["original_emr_values"][fld] = item["original_emr_value"]
+                                    if item.get("discrepancy_type"):
+                                        previous_review["discrepancy_types"][fld] = item["discrepancy_type"]
+                                    if item.get("discrepancy_note"):
+                                        previous_review["discrepancy_notes"][fld] = item["discrepancy_note"]
+                    
+                    # Load refill batch results from drug_pickups
+                    if care_record.drug_pickups and isinstance(care_record.drug_pickups, list):
+                        for item in care_record.drug_pickups:
+                            if isinstance(item, dict) and item.get("field"):
+                                field = item.get("field")
+                                corrected_on = item.get("corrected_on")
+                                
+                                if item.get("match"):
+                                    previous_review["refill_batch"][field] = "match"
+                                elif corrected_on:
+                                    previous_review["refill_batch"][field] = f"corrected_{corrected_on}"
+                                
+                                # Build drug_pickups_details for frontend
+                                drug_pickups_details.append({
+                                    "field": field,
+                                    "care_card_value": item.get("care_card_value"),
+                                    "original_emr_value": item.get("original_emr_value"),
+                                    "discrepancy_type": item.get("discrepancy_type"),
+                                    "discrepancy_note": item.get("discrepancy_note"),
+                                    "match": item.get("match", False),
+                                    "corrected_on": corrected_on
+                                })
+                                
+                                # Extract values to maps
+                                if item.get("care_card_value"):
+                                    previous_review["care_card_values"][field] = item["care_card_value"]
+                                if item.get("discrepancy_type"):
+                                    previous_review["discrepancy_types"][field] = item["discrepancy_type"]
+                                if item.get("discrepancy_note"):
+                                    previous_review["discrepancy_notes"][field] = item["discrepancy_note"]
+                    
+                    # Load VL batch results from viral_loads
+                    if care_record.viral_loads and isinstance(care_record.viral_loads, list):
+                        for item in care_record.viral_loads:
+                            if isinstance(item, dict) and item.get("field"):
+                                field = item.get("field")
+                                corrected_on = item.get("corrected_on")
+                                
+                                if item.get("match"):
+                                    previous_review["vl_batch"][field] = "match"
+                                elif corrected_on:
+                                    previous_review["vl_batch"][field] = f"corrected_{corrected_on}"
+                                
+                                # Build viral_loads_details for frontend
+                                viral_loads_details.append({
+                                    "field": field,
+                                    "care_card_value": item.get("care_card_value"),
+                                    "original_emr_value": item.get("original_emr_value"),
+                                    "discrepancy_type": item.get("discrepancy_type"),
+                                    "discrepancy_note": item.get("discrepancy_note"),
+                                    "match": item.get("match", False),
+                                    "corrected_on": corrected_on
+                                })
+                                
+                                # Extract values to maps
+                                if item.get("care_card_value"):
+                                    previous_review["care_card_values"][field] = item["care_card_value"]
+                                if item.get("discrepancy_type"):
+                                    previous_review["discrepancy_types"][field] = item["discrepancy_type"]
+                                if item.get("discrepancy_note"):
+                                    previous_review["discrepancy_notes"][field] = item["discrepancy_note"]
+                    
+                    logger.info(f"✅ Loaded: biodata={len(previous_review['biodata'])}, refill_batch={len(previous_review['refill_batch'])}, vl_batch={len(previous_review['vl_batch'])}")
+                    logger.info(f"✅ drug_pickups_details={len(drug_pickups_details)}, viral_loads_details={len(viral_loads_details)}")
+                    
+        except Exception as e:
+            logger.warning(f"Could not load previous review: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # ✅ Now safe to use care_record (might be None) after the try block
+        # The direct maps from enrollment_data are already loaded above
+        
+        # If care_record was loaded, also extract from enrollment_data direct maps
+        # (This is redundant with the loop above but ensures coverage)
+        if care_record and care_record.enrollment_data and isinstance(care_record.enrollment_data, dict):
+            ed = care_record.enrollment_data
+            # Merge direct maps (loop values take priority since they're more specific)
+            direct_types = ed.get("discrepancy_types", {})
+            direct_notes = ed.get("discrepancy_notes", {})
+            if direct_types:
+                for k, v in direct_types.items():
+                    if k not in previous_review["discrepancy_types"]:
+                        previous_review["discrepancy_types"][k] = v
+            if direct_notes:
+                for k, v in direct_notes.items():
+                    if k not in previous_review["discrepancy_notes"]:
+                        previous_review["discrepancy_notes"][k] = v
+        
+        # ================================================================
+        # GET EMR DATA
+        # ================================================================
+        with emr_engine.connect() as conn:
+            # Get patient bio
+            patient = conn.execute(
+                text("""
+                    SELECT 
+                        p.first_name, p.surname, p.other_name,
+                        INITCAP(p.sex) AS sex,
+                        p.date_of_birth,
+                        hac.visit_date::DATE AS art_start_date,
+                        facility.name AS facility_name
+                    FROM patient_person p
+                    INNER JOIN hiv_enrollment h ON h.person_uuid = p.uuid AND h.archived = 0
+                    INNER JOIN base_organisation_unit facility ON facility.id = h.facility_id
+                    LEFT JOIN hiv_art_clinical hac ON hac.hiv_enrollment_uuid = h.uuid 
+                        AND hac.archived = 0 AND hac.is_commencement = TRUE
+                    WHERE p.hospital_number = :hn AND p.archived = 0 LIMIT 1
+                """),
+                {"hn": hospital_number}
+            ).fetchone()
+            
+            if not patient:
+                return JSONResponse(status_code=404, content={"success": False, "detail": "Patient not found"})
+            
+            person_result = conn.execute(
+                text("SELECT uuid FROM patient_person WHERE hospital_number = :hn AND archived = 0"),
+                {"hn": hospital_number}
+            ).fetchone()
+            person_uuid = person_result[0] if person_result else None
+            
+            # Get refills
+            refills = []
+            if person_uuid:
+                refill_rows = conn.execute(
+                    text("""
+                        SELECT 
+                            hap.visit_date AS pickup_date,
+                            COALESCE((elem.value ->> 'duration')::INTEGER, hap.refill_period, 0) AS duration,
+                            elem.value ->> 'regimenName' AS regimen_name,
+                            hap.next_appointment
+                        FROM hiv_art_pharmacy hap
+                        CROSS JOIN LATERAL jsonb_array_elements(hap.extra -> 'regimens') WITH ORDINALITY AS elem(value, ordinality)
+                        WHERE hap.person_uuid = :uuid AND hap.archived = 0 AND elem.ordinality = 1
+                        ORDER BY hap.visit_date DESC
+                    """),
+                    {"uuid": person_uuid}
+                ).fetchall()
+                refills = [{"date": str(r[0])[:10] if r[0] else 'N/A', "duration": f"{int(r[1] or 0)} days", "regimen": r[2] or 'N/A', "next_appt": str(r[3])[:10] if r[3] else 'N/A'} for r in refill_rows]
+            
+            # Get VL results
+            viral_loads = []
+            if person_uuid:
+                vl_rows = conn.execute(
+                    text("""
+                        SELECT CAST(ls.date_sample_collected AS DATE) AS sample_date, sm.result_reported AS vl_result, CAST(sm.date_result_reported AS DATE) AS result_date
+                        FROM laboratory_result sm INNER JOIN laboratory_test lt ON lt.id = sm.test_id INNER JOIN laboratory_sample ls ON ls.test_id = lt.id
+                        WHERE lt.lab_test_id = 16 AND sm.patient_uuid = :uuid AND sm.result_reported IS NOT NULL AND sm.archived = 0
+                        ORDER BY ls.date_sample_collected DESC
+                    """),
+                    {"uuid": person_uuid}
+                ).fetchall()
+                viral_loads = [{"sample_date": str(v[0])[:10] if v[0] else 'N/A', "result": v[1] or 'N/A', "result_date": str(v[2])[:10] if v[2] else 'N/A'} for v in vl_rows]
+            
+            latest_refill = refills[0] if refills else None
+            
+            workflow = {
+                "patient_name": f"{patient[0]} {patient[1]}",
+                "hospital_number": hospital_number,
+                "previous_review": previous_review,
+                "drug_pickups_details": drug_pickups_details,  # ✅ ADD THIS
+                "viral_loads_details": viral_loads_details,    # ✅ ADD THIS
+                "steps": [
+                    {
+                        "step": 1,
+                        "title": "Biodata Verification",
+                        "icon": "bi-person-badge",
+                        "instruction": "Verify each biodata field against the physical Care Card.",
+                        "fields": [
+                            {"field": "sex", "label": "Sex", "emr_value": patient[3] or 'N/A'},
+                            {"field": "date_of_birth", "label": "Date of Birth", "emr_value": str(patient[4])[:10] if patient[4] else 'N/A'},
+                            {"field": "art_start_date", "label": "ART Start Date", "emr_value": str(patient[5])[:10] if patient[5] else 'N/A'}
+                        ]
+                    },
+                    {
+                        "step": 2,
+                        "title": "Latest Refill Details",
+                        "icon": "bi-capsule",
+                        "instruction": "Verify the most recent refill details against the Care Card.",
+                        "fields": [
+                            {"field": "last_pickup_date", "label": "Last Pickup Date", "emr_value": latest_refill['date'] if latest_refill else 'N/A'},
+                            {"field": "refill_duration", "label": "Refill Duration", "emr_value": latest_refill['duration'] if latest_refill else 'N/A'},
+                            {"field": "regimen", "label": "Current Regimen", "emr_value": latest_refill['regimen'] if latest_refill else 'N/A'}
+                        ]
+                    },
+                    {
+                        "step": 3,
+                        "title": "Refill History Review",
+                        "icon": "bi-calendar3",
+                        "instruction": "Review all refill records as a batch. Select overall status for each category.",
+                        "refills": refills
+                    },
+                    {
+                        "step": 4,
+                        "title": "Viral Load History",
+                        "icon": "bi-droplet",
+                        "instruction": "Review all viral load results as a batch. Select overall status for each category.",
+                        "viral_loads": viral_loads
+                    }
+                ]
+            }
+            
+            logger.info(f"✅ Returning workflow with drug_pickups_details={len(drug_pickups_details)}, viral_loads_details={len(viral_loads_details)}")
+            
+            return {"success": True, "workflow": workflow}
+            
+    except Exception as e:
+        logger.error(f"Review workflow error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+    
+# ============================================================================
+# DQA PERFORMANCE DASHBOARD API
+# ============================================================================
+
+@app.get("/api/dashboard/performance")
+async def get_performance_data(
+    request: Request,
+    start_date: str = None,
+    end_date: str = None,
+    facility: str = None
+):
+    """
+    Returns performance data for all assessors.
+    Includes leaderboard rankings, stats, and weekly trend data.
+    """
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import CareCardRecord, User
+        from sqlalchemy.orm import Session
+        from sqlalchemy import func, text
+        from datetime import datetime, timedelta
+        
+        with Session(dqa_engine) as session:
+            # Base query for verified records
+            query = session.query(CareCardRecord).filter(CareCardRecord.is_verified == True)
+            
+            if start_date:
+                query = query.filter(CareCardRecord.verified_at >= start_date)
+            if end_date:
+                query = query.filter(CareCardRecord.verified_at <= end_date + "T23:59:59")
+            
+            # Facility filter
+            if facility:
+                from app.database import emr_engine
+                # Get hospital numbers for this facility
+                with emr_engine.connect() as conn:
+                    facility_hns = conn.execute(text("""
+                        SELECT p.hospital_number
+                        FROM patient_person p
+                        INNER JOIN hiv_enrollment h ON h.person_uuid = p.uuid AND h.archived = 0
+                        INNER JOIN base_organisation_unit f ON f.id = h.facility_id
+                        WHERE f.name = :facility AND p.archived = 0
+                    """), {"facility": facility}).fetchall()
+                    hn_list = [r[0] for r in facility_hns]
+                    if hn_list:
+                        query = query.filter(CareCardRecord.hospital_number.in_(hn_list))
+                    else:
+                        query = query.filter(CareCardRecord.hospital_number == "__none__")
+            
+            records = query.all()
+            
+            # Get all users
+            users = session.query(User).filter(User.is_active == True).all()
+            
+            # Build assessor performance map
+            assessor_map = {}
+            for user in users:
+                username = user.full_name or user.username
+                assessor_map[username] = {
+                    "username": user.username,
+                    "full_name": user.full_name,
+                    "role": user.role,
+                    "position": user.position or "",
+                    "total_assessed": 0,
+                    "total_fields": 0,
+                    "matched": 0,
+                    "corrected_emr": 0,
+                    "corrected_carecard": 0,
+                    "last_active": str(user.last_login) if user.last_login else None
+                }
+            
+            # Aggregate record data
+            for record in records:
+                verified_by = record.verified_by or record.created_by or "Unknown"
+                
+                if verified_by not in assessor_map:
+                    assessor_map[verified_by] = {
+                        "username": verified_by,
+                        "full_name": verified_by,
+                        "role": "dqa_team",
+                        "position": "",
+                        "total_assessed": 0,
+                        "total_fields": 0,
+                        "matched": 0,
+                        "corrected_emr": 0,
+                        "corrected_carecard": 0,
+                        "last_active": str(record.verified_at) if record.verified_at else None
+                    }
+                
+                ed = record.enrollment_data or {}
+                assessor_map[verified_by]["total_assessed"] += 1
+                assessor_map[verified_by]["total_fields"] += ed.get("biodata_total", 0) + ed.get("latest_refill_total", 0)
+                assessor_map[verified_by]["matched"] += ed.get("biodata_matched", 0) + ed.get("latest_refill_matched", 0)
+                
+                # Count batch corrections
+                for dp in (record.drug_pickups or []):
+                    if dp.get("corrected_on") == "emr":
+                        assessor_map[verified_by]["corrected_emr"] += 1
+                    elif dp.get("corrected_on") == "care_card":
+                        assessor_map[verified_by]["corrected_carecard"] += 1
+                
+                for vl in (record.viral_loads or []):
+                    if vl.get("corrected_on") == "emr":
+                        assessor_map[verified_by]["corrected_emr"] += 1
+                    elif vl.get("corrected_on") == "care_card":
+                        assessor_map[verified_by]["corrected_carecard"] += 1
+                
+                # Update last active
+                if record.verified_at:
+                    current_last = assessor_map[verified_by].get("last_active")
+                    if not current_last or str(record.verified_at) > current_last:
+                        assessor_map[verified_by]["last_active"] = str(record.verified_at)
+            
+            # Sort by total_assessed descending
+            assessors = sorted(assessor_map.values(), key=lambda x: x["total_assessed"], reverse=True)
+            
+            # Calculate stats
+            total_assessed = sum(a["total_assessed"] for a in assessors)
+            active_assessors = sum(1 for a in assessors if a["total_assessed"] > 0)
+            top_performer = assessors[0]["full_name"] if assessors else "—"
+            
+            total_fields_all = sum(a["total_fields"] for a in assessors)
+            total_matched_all = sum(a["matched"] for a in assessors)
+            overall_match_rate = f"{round((total_matched_all / total_fields_all * 100), 1)}%" if total_fields_all > 0 else "0%"
+            
+            # Build weekly trend data
+            trend_labels = []
+            trend_assessors = {}
+            
+            if records:
+                # Last 8 weeks
+                now = datetime.utcnow()
+                for week_offset in range(7, -1, -1):
+                    week_start = (now - timedelta(days=week_offset * 7)).strftime('%Y-%m-%d')
+                    week_end = (now - timedelta(days=(week_offset - 1) * 7)).strftime('%Y-%m-%d')
+                    trend_labels.append(f"{week_start[5:]} to {week_end[5:]}")
+                    
+                    for assessor in assessors:
+                        name = assessor["full_name"]
+                        if name not in trend_assessors:
+                            trend_assessors[name] = []
+                        
+                        count = session.query(CareCardRecord).filter(
+                            CareCardRecord.is_verified == True,
+                            func.date(CareCardRecord.verified_at) >= week_start,
+                            func.date(CareCardRecord.verified_at) < week_end,
+                            (CareCardRecord.verified_by == name) | (CareCardRecord.created_by == name)
+                        ).count()
+                        trend_assessors[name].append(count)
+            
+            return {
+                "success": True,
+                "total_assessed": total_assessed,
+                "active_assessors": active_assessors,
+                "top_performer": top_performer,
+                "overall_match_rate": overall_match_rate,
+                "assessors": assessors,
+                "trend": {
+                    "labels": trend_labels,
+                    "assessors": trend_assessors
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+
+@app.get("/api/dashboard/facilities")
+async def get_facilities(request: Request):
+    """Get list of facilities for filter dropdown"""
+    try:
+        from app.database import emr_engine
+        from sqlalchemy import text
+        
+        with emr_engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT DISTINCT facility.name
+                FROM patient_person p
+                INNER JOIN hiv_enrollment h ON h.person_uuid = p.uuid AND h.archived = 0
+                INNER JOIN base_organisation_unit facility ON facility.id = h.facility_id
+                WHERE p.archived = 0
+                ORDER BY facility.name
+            """)).fetchall()
+            facilities = [r[0] for r in result if r[0]]
+        
+        return {"success": True, "facilities": facilities}
+    except Exception as e:
+        return {"success": True, "facilities": []}
+
+
+@app.get("/api/dashboard/performance/excel")
+async def export_performance_excel(
+    request: Request,
+    start_date: str = None,
+    end_date: str = None,
+    facility: str = None
+):
+    """Export performance data to Excel"""
+    try:
+        from app.database import dqa_engine, emr_engine
+        from app.models.dqa_models import CareCardRecord, User
+        from sqlalchemy.orm import Session
+        from sqlalchemy import text
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        from datetime import datetime
+        import io
+        
+        with Session(dqa_engine) as session:
+            query = session.query(CareCardRecord).filter(CareCardRecord.is_verified == True)
+            if start_date:
+                query = query.filter(CareCardRecord.verified_at >= start_date)
+            if end_date:
+                query = query.filter(CareCardRecord.verified_at <= end_date + "T23:59:59")
+            
+            records = query.all()
+        
+        # Aggregate by assessor
+        assessor_map = {}
+        for record in records:
+            verified_by = record.verified_by or record.created_by or "Unknown"
+            if verified_by not in assessor_map:
+                assessor_map[verified_by] = {"name": verified_by, "folders": 0, "matched": 0, "total_fields": 0, "corrected_emr": 0, "corrected_carecard": 0}
+            
+            ed = record.enrollment_data or {}
+            assessor_map[verified_by]["folders"] += 1
+            assessor_map[verified_by]["total_fields"] += ed.get("biodata_total", 0) + ed.get("latest_refill_total", 0)
+            assessor_map[verified_by]["matched"] += ed.get("biodata_matched", 0) + ed.get("latest_refill_matched", 0)
+            
+            for dp in (record.drug_pickups or []):
+                if dp.get("corrected_on") == "emr": assessor_map[verified_by]["corrected_emr"] += 1
+                elif dp.get("corrected_on") == "care_card": assessor_map[verified_by]["corrected_carecard"] += 1
+            for vl in (record.viral_loads or []):
+                if vl.get("corrected_on") == "emr": assessor_map[verified_by]["corrected_emr"] += 1
+                elif vl.get("corrected_on") == "care_card": assessor_map[verified_by]["corrected_carecard"] += 1
+        
+        assessors = sorted(assessor_map.values(), key=lambda x: x["folders"], reverse=True)
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "DQA Performance"
+        
+        header_fill = PatternFill(start_color="1a365d", end_color="1a365d", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
+        thin_border = Border(left=Side(style='thin', color='d1d5db'), right=Side(style='thin', color='d1d5db'),
+                             top=Side(style='thin', color='d1d5db'), bottom=Side(style='thin', color='d1d5db'))
+        
+        headers = ["Rank", "Assessor Name", "Folders Assessed", "Total Fields", "Matched", "Match Rate", "Corrected (EMR)", "Corrected (Care Card)"]
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.font = header_font; c.fill = header_fill; c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True); c.border = thin_border
+        ws.row_dimensions[1].height = 32
+        
+        for i, a in enumerate(assessors):
+            row = i + 2
+            match_rate = f"{round((a['matched']/a['total_fields']*100),1)}%" if a['total_fields'] > 0 else "0%"
+            vals = [i+1, a['name'], a['folders'], a['total_fields'], a['matched'], match_rate, a['corrected_emr'], a['corrected_carecard']]
+            for col, v in enumerate(vals, 1):
+                c = ws.cell(row=row, column=col, value=v)
+                c.border = thin_border; c.font = Font(size=9, name="Calibri")
+                c.alignment = Alignment(horizontal="center" if col != 2 else "left", vertical="center")
+        
+        widths = {1:6, 2:30, 3:16, 4:14, 5:12, 6:12, 7:16, 8:18}
+        for col, w in widths.items():
+            ws.column_dimensions[get_column_letter(col)].width = w
+        ws.freeze_panes = 'A2'
+        
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f"attachment; filename=DQA_Performance_{datetime.now().strftime('%Y%m%d')}.xlsx"})
+    except Exception as e:
+        logger.error(f"Export error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+    
+@app.get("/dashboard")
+async def serve_dashboard():
+    """Serve the performance dashboard page"""
+    from fastapi.responses import FileResponse
+    import os
+    
+    # Get the base directory
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Try multiple possible locations
+    possible_paths = [
+        os.path.join(base_dir, "templates", "dashboard.html"),
+        os.path.join(base_dir, "..", "templates", "dashboard.html"),
+        os.path.join(base_dir, "..", "static", "dashboard.html"),
+        os.path.join(base_dir, "static", "dashboard.html"),
+    ]
+    
+    # If frozen (PyInstaller)
+    if getattr(sys, 'frozen', False):
+        possible_paths.insert(0, os.path.join(sys._MEIPASS, "app", "templates", "dashboard.html"))
+        possible_paths.insert(0, os.path.join(sys._MEIPASS, "templates", "dashboard.html"))
+    
+    for path in possible_paths:
+        abs_path = os.path.abspath(path)
+        logger.info(f"Checking path: {abs_path}")
+        if os.path.exists(abs_path):
+            logger.info(f"✅ Found dashboard at: {abs_path}")
+            return FileResponse(abs_path, media_type="text/html")
+    
+    logger.error(f"❌ Dashboard not found in any of: {possible_paths}")
+    return JSONResponse(
+        status_code=404,
+        content={"error": f"Dashboard not found. Checked: {possible_paths}"}
+    )
+
+from app.routers.singlereport import generate_dqa_verification_pdf, get_status, DISC_LABELS
+
+@app.get("/api/reports/dqa-verification/{hospital_number:path}")
+async def dqa_verification_pdf_route(hospital_number: str, request: Request):
+    return await generate_dqa_verification_pdf(hospital_number, request)
+# ============================================================================
+# BATCH PDF - NO COVER PAGE, WIDE TABLE, PROFESSIONAL
+# ============================================================================
+from app.routers.batchreport import generate_batch_verification_pdf
+
+@app.get("/api/reports/dqa-verification-batch")
+async def dqa_verification_batch_route(
+    request: Request,
+    start_date: str = None,
+    end_date: str = None,
+    username: str = None
+):
+    return await generate_batch_verification_pdf(
+        request,
+        start_date,
+        end_date,
+        username
+    )
+# ============================================================================
+# BATCH COUNT
+# ============================================================================
+
+@app.get("/api/reports/batch-count")
+async def get_batch_count(
+    request: Request,
+    start_date: str = None,
+    end_date: str = None,
+    username: str = None
+):
+    """Get count of verified records for batch print preview"""
+    try:
+        from app.database import dqa_engine
+        from app.models.dqa_models import CareCardRecord
+        from sqlalchemy.orm import Session
+        from sqlalchemy import cast, Date
+        
+        with Session(dqa_engine) as session:
+            query = session.query(CareCardRecord).filter(CareCardRecord.is_verified == True)
+            
+            if username:
+                query = query.filter(
+                    (CareCardRecord.verified_by == username) | 
+                    (CareCardRecord.created_by == username)
+                )
+            
+            if start_date:
+                query = query.filter(cast(CareCardRecord.verified_at, Date) >= start_date)
+            if end_date:
+                query = query.filter(cast(CareCardRecord.verified_at, Date) <= end_date)
+            
+            count = query.count()
+        
+        return {"success": True, "count": count}
+    except Exception as e:
+        return {"success": False, "count": 0, "detail": str(e)}
+
+@app.put("/api/patients/update-vl")
+async def update_viral_load(request: Request):
+    """
+    Update Viral Load laboratory data in EMR.
+    Updates the exact VL record matching the sample collection date.
+    """
+    try:
+        from app.database import emr_engine
+        from sqlalchemy import text
+        
+        body = await request.json()
+        hospital_number = body.get("hospital_number")
+        field_name = body.get("field_name")
+        new_value = body.get("new_value")
+        sample_date = body.get("sample_date")
+        user = request.headers.get("X-User", "Unknown")
+        
+        if not hospital_number or not field_name or not new_value:
+            return JSONResponse(status_code=400, content={"success": False, "detail": "Missing required fields"})
+        
+        logger.info(f"🔬 Updating VL {field_name} for {hospital_number} (sample: {sample_date}) to '{new_value}' by {user}")
+        
+        with emr_engine.connect() as conn:
+            # Get person_uuid
+            person = conn.execute(text(
+                "SELECT uuid FROM patient_person WHERE hospital_number = :hn AND archived = 0"
+            ), {"hn": hospital_number}).fetchone()
+            
+            if not person:
+                return JSONResponse(status_code=404, content={"success": False, "detail": "Patient not found"})
+            
+            person_uuid = person[0]
+            rows_updated = 0
+            
+            if field_name == "sample_collection_date":
+                # Find the exact sample by its current date and update it
+                result = conn.execute(text("""
+                    UPDATE laboratory_sample
+                    SET date_sample_collected = CAST(:new_date AS DATE)
+                    WHERE id IN (
+                        SELECT ls.id
+                        FROM laboratory_sample ls
+                        INNER JOIN laboratory_test lt ON lt.id = ls.test_id
+                        WHERE lt.lab_test_id = 16
+                          AND ls.patient_uuid = :uuid
+                          AND ls.archived = 0
+                          AND CAST(ls.date_sample_collected AS DATE) = CAST(:sample_date AS DATE)
+                        LIMIT 1
+                    )
+                """), {"new_date": new_value, "uuid": person_uuid, "sample_date": sample_date})
+                rows_updated = result.rowcount
+                
+            elif field_name == "vl_result":
+                # Find the result linked to this sample date and update it
+                result = conn.execute(text("""
+                    UPDATE laboratory_result
+                    SET result_reported = :new_result
+                    WHERE id IN (
+                        SELECT lr.id
+                        FROM laboratory_result lr
+                        INNER JOIN laboratory_test lt ON lt.id = lr.test_id
+                        INNER JOIN laboratory_sample ls ON ls.test_id = lt.id
+                        WHERE lt.lab_test_id = 16
+                          AND lr.patient_uuid = :uuid
+                          AND lr.archived = 0
+                          AND CAST(ls.date_sample_collected AS DATE) = CAST(:sample_date AS DATE)
+                        ORDER BY ls.date_sample_collected DESC
+                        LIMIT 1
+                    )
+                """), {"new_result": new_value, "uuid": person_uuid, "sample_date": sample_date})
+                rows_updated = result.rowcount
+                
+            elif field_name == "result_date":
+                # Find the result linked to this sample date and update its result date
+                result = conn.execute(text("""
+                    UPDATE laboratory_result
+                    SET date_result_reported = CAST(:new_date AS DATE)
+                    WHERE id IN (
+                        SELECT lr.id
+                        FROM laboratory_result lr
+                        INNER JOIN laboratory_test lt ON lt.id = lr.test_id
+                        INNER JOIN laboratory_sample ls ON ls.test_id = lt.id
+                        WHERE lt.lab_test_id = 16
+                          AND lr.patient_uuid = :uuid
+                          AND lr.archived = 0
+                          AND CAST(ls.date_sample_collected AS DATE) = CAST(:sample_date AS DATE)
+                        ORDER BY ls.date_sample_collected DESC
+                        LIMIT 1
+                    )
+                """), {"new_date": new_value, "uuid": person_uuid, "sample_date": sample_date})
+                rows_updated = result.rowcount
+            
+            conn.commit()
+            
+            logger.info(f"✅ VL {field_name} updated: {rows_updated} row(s) affected")
+            
+            if rows_updated == 0:
+                return JSONResponse(status_code=404, content={"success": False, "detail": f"No VL record found for sample date {sample_date}"})
+            
+            return {"success": True, "message": f"VL {field_name} updated successfully", "rows_updated": rows_updated}
+            
+    except Exception as e:
+        logger.error(f"VL update error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
+
+@app.delete("/api/patients/delete-vl")
+async def delete_viral_load(request: Request):
+    """
+    Delete an entire Viral Load record from EMR.
+    Archives both laboratory_sample and laboratory_result by matching sample date.
+    """
+    try:
+        from app.database import emr_engine
+        from sqlalchemy import text
+        
+        body = await request.json()
+        hospital_number = body.get("hospital_number")
+        sample_date = body.get("sample_date")
+        user = request.headers.get("X-User", "Unknown")
+        
+        if not hospital_number or not sample_date:
+            return JSONResponse(status_code=400, content={"success": False, "detail": "Missing required fields"})
+        
+        logger.info(f"🗑️ Deleting VL record for {hospital_number} dated {sample_date} by {user}")
+        
+        with emr_engine.connect() as conn:
+            # Get person_uuid
+            person = conn.execute(text(
+                "SELECT uuid FROM patient_person WHERE hospital_number = :hn AND archived = 0"
+            ), {"hn": hospital_number}).fetchone()
+            
+            if not person:
+                return JSONResponse(status_code=404, content={"success": False, "detail": "Patient not found"})
+            
+            person_uuid = person[0]
+            
+            # Find the sample ID first
+            sample_record = conn.execute(text("""
+                SELECT ls.id, ls.test_id
+                FROM laboratory_sample ls
+                INNER JOIN laboratory_test lt ON lt.id = ls.test_id
+                WHERE lt.lab_test_id = 16
+                  AND ls.patient_uuid = :uuid
+                  AND ls.archived = 0
+                  AND CAST(ls.date_sample_collected AS DATE) = CAST(:sample_date AS DATE)
+                ORDER BY ls.date_sample_collected DESC
+                LIMIT 1
+            """), {"uuid": person_uuid, "sample_date": sample_date}).fetchone()
+            
+            if not sample_record:
+                return JSONResponse(status_code=404, content={"success": False, "detail": f"No VL sample found for date {sample_date}"})
+            
+            sample_id = sample_record[0]
+            test_id = sample_record[1]
+            
+            # Archive the sample
+            conn.execute(text("""
+                UPDATE laboratory_sample SET archived = 1
+                WHERE id = :sample_id
+            """), {"sample_id": sample_id})
+            
+            # Archive the result
+            result = conn.execute(text("""
+                UPDATE laboratory_result SET archived = 1
+                WHERE test_id = :test_id
+                  AND patient_uuid = :uuid
+                  AND archived = 0
+            """), {"test_id": test_id, "uuid": person_uuid})
+            
+            conn.commit()
+            
+            logger.info(f"✅ VL record deleted: sample_id={sample_id}, test_id={test_id}, results_archived={result.rowcount}")
+            
+            # Log the deletion
+            try:
+                from app.database import dqa_engine
+                from app.models.dqa_models import CorrectionLog
+                from sqlalchemy.orm import Session
+                
+                with Session(dqa_engine) as dqa_session:
+                    log = CorrectionLog(
+                        hospital_number=hospital_number,
+                        person_uuid=person_uuid,
+                        field_corrected="vl_record_deleted",
+                        old_value=f"Sample Date: {sample_date}",
+                        new_value="DELETED",
+                        corrected_by=user,
+                        record_type="viral_load"
+                    )
+                    dqa_session.add(log)
+                    dqa_session.commit()
+            except Exception as log_error:
+                logger.warning(f"Correction log failed: {log_error}")
+            
+            return {"success": True, "message": f"VL record for {sample_date} deleted successfully"}
+            
+    except Exception as e:
+        logger.error(f"VL delete error: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)})
 # ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================

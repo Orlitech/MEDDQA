@@ -110,3 +110,35 @@ class CareCardRecord(Base):
     
     def __repr__(self):
         return f"<CareCardRecord {self.hospital_number} - Pickups: {len(self.drug_pickups or [])}, VLs: {len(self.viral_loads or [])}>"
+
+class User(Base):
+    """System users for access control and activity tracking"""
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(UUID(as_uuid=True), default=uuid.uuid4, unique=True)
+    full_name = Column(String(200), nullable=False)
+    username = Column(String(100), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(50), nullable=False, default="dqa_team")  # admin, assessor, dqa_team
+    position = Column(String(200))
+    is_active = Column(Boolean, default=True)
+    last_login = Column(DateTime(timezone=True))
+    created_by = Column(String(200))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class ActivityLog(Base):
+    """Track all user activities"""
+    __tablename__ = "activity_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(UUID(as_uuid=True), default=uuid.uuid4, unique=True)
+    user_id = Column(Integer)
+    username = Column(String(100))
+    action = Column(String(200))  # e.g., "search_patient", "update_regimen", "submit_dqa"
+    details = Column(JSON)
+    hospital_number = Column(String(100))
+    ip_address = Column(String(50))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
